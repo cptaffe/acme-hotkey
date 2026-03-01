@@ -6,43 +6,39 @@ package main
 #include "ctap.h"
 */
 import "C"
-import "unsafe"
+import (
+	"log"
+	"unsafe"
+)
 
 // KeyEvent is a keyboard event published to the keys stream.
 // The original CGEventRef lives entirely in C's circular buffer; Go never
-// holds it.
+// holds it.  Auto-repeat events are passed through directly in C and never
+// reach Go.
 type KeyEvent struct {
-	KeyCode  uint16
-	Flags    uint64
-	Str      string // e.g. "command b" or "repeat command b"
-	IsRepeat bool
+	KeyCode uint16
+	Flags   uint64
+	Str     string // e.g. "command b", "shift a", "escape"
 }
 
 // eventStream carries KeyEvents from the CGEventTap callback into Go.
 var eventStream = make(chan KeyEvent, 4096)
 
-// goKeyDown is called from C for every intercepted non-modifier keyDown.
-// The corresponding CGEventRef has already been CFRetain'd and stored in
-// C's circular buffer; Go just receives the metadata needed to forward
-// the event string to the cawk pipeline.
+// goKeyDown is called from C for every intercepted non-modifier, non-repeat
+// keyDown.  Auto-repeat events are passed through directly in the tap
+// callback and never reach Go.  The CGEventRef is already CFRetain'd and
+// stored in C's circular buffer; Go only needs the string for the pipeline.
 //
 //export goKeyDown
-func goKeyDown(kc C.ushort, flags C.ulonglong, isRepeat C.int) {
+func goKeyDown(kc C.ushort, flags C.ulonglong) {
 	code := uint16(kc)
 	str := formatState(uint64(flags), []uint16{code})
-	if isRepeat != 0 {
-		str = "repeat " + str
-	}
-	ev := KeyEvent{
-		KeyCode:  code,
-		Flags:    uint64(flags),
-		Str:      str,
-		IsRepeat: isRepeat != 0,
-	}
+	ev := KeyEvent{KeyCode: code, Flags: uint64(flags), Str: str}
+	log.Printf("goKeyDown: %q", ev.Str)
 	select {
 	case eventStream <- ev:
 	default:
-		// Buffer full — drop: advance the C buffer tail immediately.
+		log.Printf("goKeyDown: eventStream full, dropping %q", ev.Str)
 		C.ackNext(0)
 	}
 }

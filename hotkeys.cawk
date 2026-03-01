@@ -7,11 +7,24 @@
 # The keys file works like Acme's event file: reading delivers one event per
 # line; writing back acknowledges it.  Write-backs decide the event's fate:
 #
-#   print $0        → forward: original event re-posted to the application
-#   print "!" $0   → drop:    original event consumed (hotkey handled here)
+#   print $0          → forward: original event re-posted to the application
+#   printf "!%s", $0  → drop:    original event consumed (hotkey handled here)
 #
-# Lines prefixed with "repeat " are auto-repeat events; hotkey patterns do
-# not match them, so they are always forwarded.
+# Execution model (new cawk x-expression semantics):
+#   Each top-level /re/ rule is an x-expression anchored at the current stream
+#   position.  The pattern includes the trailing \n so $0 = "command s\n".
+#   First matching rule wins; the stream advances by len($0), so later rules
+#   never see the same bytes.  The bare catch-all block { } consumes any line
+#   not matched above and gives $0 WITHOUT the trailing newline (AWK compat),
+#   so plain `print $0` re-emits the event correctly.
+#
+# To drop a matched event: printf "!%s", $0
+#   (printf is used instead of print because $0 already contains the newline;
+#    print would add a second one via ORS.)
+#
+# Lines prefixed with "repeat " are auto-repeat events; they do not match any
+# hotkey pattern (which lack the "repeat " prefix) and fall through to the
+# catch-all, which forwards them unchanged.
 #
 # Event format (space-separated, modifiers first):
 #   command b          ⌘B (initial press)
@@ -46,26 +59,11 @@ BEGIN {
 
 # focused_win returns the window ID from acme-focused, validated against the
 # live acme index.  Returns 0 if unavailable or if the window no longer exists.
-function focused_win(    pipe, id, line, found) {
+function focused_win(    pipe, id) {
     pipe = "9p read acme-focused/focus"
     pipe | getline id
     close(pipe)
-    id = id + 0
-    if (id == 0) {
-        return 0
-    }
-    found = 0
-    pipe = "9p read acme/index"
-    while ((pipe | getline line) > 0) {
-        if ((line + 0) == id) {
-            found = 1
-        }
-    }
-    close(pipe)
-    if (found) {
-        return id
-    }
-    return 0
+    return id + 0
 }
 
 function ctl(winid, cmd) {
@@ -91,6 +89,10 @@ function putall(    pipe, line, a, id, isdir, ismod) {
 }
 
 function run(cmd,    winid, errpipe, runcmd, line) {
+    # New does not require a focused window — always allowed.
+    if (cmd == "New")    { system("9p read acme/new/ctl > /dev/null"); return }
+    if (cmd == "Putall") { putall(); return }
+
     winid = focused_win()
     if (winid == 0) { return }
 
@@ -98,8 +100,6 @@ function run(cmd,    winid, errpipe, runcmd, line) {
     if (cmd == "Get")    { ctl(winid, "get");    return }
     if (cmd == "Del")    { ctl(winid, "del");    return }
     if (cmd == "Delete") { ctl(winid, "delete"); return }
-    if (cmd == "New")    { system("9p read acme/new/ctl > /dev/null"); return }
-    if (cmd == "Putall") { putall(); return }
 
     errpipe = "9p write acme/" winid "/errors"
     runcmd  = "winid=" winid " " cmd " 2>&1"
@@ -111,22 +111,25 @@ function run(cmd,    winid, errpipe, runcmd, line) {
 }
 
 # ── Acme built-in keytab ─────────────────────────────────────────────────────
-# Hotkeys: run the command and print "!" $0 to drop the original event.
+# Each pattern is an x-expression that matches the exact event line including
+# its trailing newline.  $0 = "command s\n"; printf "!%s" re-emits it with the
+# leading "!" that signals the hotkey was consumed (no extra newline from ORS).
 
-/^command s$/          { run("Put");       print "!" $0; fflush(); next }
-/^command shift s$/    { run("Putall");    print "!" $0; fflush(); next }
-/^command shift f$/    { run("Look");      print "!" $0; fflush(); next }
-/^command w$/          { run("Del");       print "!" $0; fflush(); next }
-/^command shift w$/    { run("Delcol");    print "!" $0; fflush(); next }
-/^command n$/          { run("New");       print "!" $0; fflush(); next }
-/^command shift n$/    { run("Newcol");    print "!" $0; fflush(); next }
-/^command semicolon$/  { run("Spell");     print "!" $0; fflush(); next }
-/^command t$/          { run("win");       print "!" $0; fflush(); next }
-/^command b$/          { run("Ldef");      print "!" $0; fflush(); next }
-/^command shift b$/    { run("Lrefs");     print "!" $0; fflush(); next }
-/^escape$/             { run("V");         print "!" $0; fflush(); next }
-/^command p$/          { run("Search");    print "!" $0; fflush(); next }
-/^command shift h$/    { run("Highlight"); print "!" $0; fflush(); next }
+/command s\n/          { run("Put");       printf "!%s", $0; fflush() }
+/command shift s\n/    { run("Putall");    printf "!%s", $0; fflush() }
+/command shift f\n/    { run("Look");      printf "!%s", $0; fflush() }
+/command w\n/          { run("Del");       printf "!%s", $0; fflush() }
+/command shift w\n/    { run("Delcol");    printf "!%s", $0; fflush() }
+/command n\n/          { run("New");       printf "!%s", $0; fflush() }
+/command shift n\n/    { run("Newcol");    printf "!%s", $0; fflush() }
+/command semicolon\n/  { run("Spell");     printf "!%s", $0; fflush() }
+/command t\n/          { run("win");       printf "!%s", $0; fflush() }
+/command b\n/          { run("Ldef");      printf "!%s", $0; fflush() }
+/command shift b\n/    { run("Lrefs");     printf "!%s", $0; fflush() }
+/escape\n/             { run("V");         printf "!%s", $0; fflush() }
+/command p\n/          { run("Search");    printf "!%s", $0; fflush() }
+/command shift h\n/    { run("Highlight"); printf "!%s", $0; fflush() }
 
 # ── Default: forward all unmatched events back to the application ─────────────
+# Bare block: $0 = line WITHOUT trailing newline; print adds ORS (\n).
 { print $0; fflush() }

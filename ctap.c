@@ -5,8 +5,7 @@
 #include <string.h>
 
 /* Exported by CGo (//export in tap.go). */
-extern void goKeyDown(unsigned short keyCode, unsigned long long flags,
-                      int isRepeat);
+extern void goKeyDown(unsigned short keyCode, unsigned long long flags);
 
 static CFMachPortRef gTap;
 
@@ -61,6 +60,9 @@ shouldInterceptEvent(CGEventRef event)
 	for (int i = 0; i < nFilter; i++)
 		if (strcmp(name, filterProcs[i]) == 0) { ok = 1; break; }
 	pthread_mutex_unlock(&filterMu);
+	if (!ok)
+		fprintf(stderr, "acme-hotkey: filter miss: proc=\"%s\" nl=%d nf=%d\n",
+		    name, nl, nf);
 	return ok;
 }
 
@@ -118,6 +120,8 @@ ackNext(int forward)
 	}
 	PendingEntry e = gPending[gTail];
 	gTail = (gTail + 1) % PENDING_CAP;
+	fprintf(stderr, "acme-hotkey: ackNext forward=%d kc=0x%02x tail=%d head=%d\n",
+	    forward, (int)e.kc, gTail, gHead);
 
 	/* Check for remaining events for this keycode after advancing tail. */
 	int more = hasPendingForKey(e.kc);
@@ -190,40 +194,50 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 		pthread_mutex_lock(&gPendMu);
 		int pending = hasPendingForKey((uint16_t)kc);
 		if (pending) {
-			/*
-			 * In-flight events still exist for this keycode.
-			 * Buffer the keyUp; ackNext() will release it once
-			 * the last entry for this key is consumed.
-			 */
 			CFRetain(event);
 			pendingKeyUp[kc & 0xFF] = event;
 		}
 		pthread_mutex_unlock(&gPendMu);
+		fprintf(stderr, "acme-hotkey: keyup kc=0x%02x pending=%d\n", (int)kc, pending);
 		return pending ? NULL : event;
 	}
 
 	if (type == kCGEventKeyDown) {
 		if (isModifier(kc))
 			return event;
-		if (!shouldInterceptEvent(event))
-			return event;
 
+		/*
+		 * Auto-repeat events: pass through immediately without entering
+		 * the pipeline.  The session-level auto-repeat timer only starts
+		 * when a keyDown passes through kCGSessionEventTap, so if we
+		 * suppress the first keyDown the OS never generates repeats.
+		 * By the time the first repeat arrives (≥500 ms later) the
+		 * initial keyDown has long since been acked and the C buffer is
+		 * empty, so there is no ordering hazard.
+		 */
 		int isRepeat = (int)CGEventGetIntegerValueField(event,
 		    kCGKeyboardEventAutorepeat);
+		if (isRepeat)
+			return event;
+
+		if (!shouldInterceptEvent(event))
+			return event;
 
 		pthread_mutex_lock(&gPendMu);
 		int next = (gHead + 1) % PENDING_CAP;
 		if (next == gTail) {
-			/* Buffer full — pass event through rather than blocking. */
 			pthread_mutex_unlock(&gPendMu);
+			fprintf(stderr, "acme-hotkey: C buf full, passing kc=0x%02x through\n", (int)kc);
 			return event;
 		}
 		CFRetain(event);
 		gPending[gHead] = (PendingEntry){ event, (uint16_t)kc };
 		gHead = next;
+		fprintf(stderr, "acme-hotkey: queued kc=0x%02x head=%d tail=%d\n",
+		    (int)kc, gHead, gTail);
 		pthread_mutex_unlock(&gPendMu);
 
-		goKeyDown((unsigned short)kc, flags, isRepeat);
+		goKeyDown((unsigned short)kc, flags);
 		return NULL;
 	}
 
