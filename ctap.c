@@ -62,7 +62,7 @@ shouldIntercept(void)
 	pthread_mutex_unlock(&filterMu);
 
 	if (nl == 0)
-		return 0;	/* nobody is reading keys — pass everything through */
+		return 0;
 
 	if (nf == 0)
 		return 1;

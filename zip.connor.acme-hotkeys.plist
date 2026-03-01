@@ -8,7 +8,7 @@
 	<array>
 		<string>/bin/sh</string>
 		<string>-c</string>
-		<string>9p read acme-hotkey/keys | cawk -f /Users/cptaffe/src/acme-hotkey/hotkeys.cawk</string>
+		<string>printf 'acme\n' | 9p write acme-hotkey/filter &amp;&amp; 9p read acme-hotkey/keys | cawk -f /Users/cptaffe/src/acme-hotkey/hotkeys.cawk</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
