@@ -44,10 +44,6 @@ BEGIN {
     }
     passthrough = "9p -a 'unix!" ns "/acme-hotkey' write keys"
 
-    # Restrict interception to the acme devdraw process.
-    print "devdraw" | "9p -a 'unix!" ns "/acme-hotkey' write filter"
-    close("9p -a 'unix!" ns "/acme-hotkey' write filter")
-
     # Modifier token set — used to detect keydown vs state-only lines.
     mods["command"] = 1
     mods["shift"]   = 1

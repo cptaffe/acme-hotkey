@@ -107,7 +107,8 @@ func (b *KeyBroker) subscribe() (id uint64, ch <-chan KeyEvent) {
 
 // unsubscribe cancels the subscription and closes the channel so any
 // goroutine blocked on it wakes up and can detect the closure.
-func (b *KeyBroker) unsubscribe(id uint64) {
+// unsubscribe cancels the subscription and returns the remaining count.
+func (b *KeyBroker) unsubscribe(id uint64) int {
 	b.mu.Lock()
 	if ch, ok := b.subs[id]; ok {
 		close(ch)
@@ -116,6 +117,7 @@ func (b *KeyBroker) unsubscribe(id uint64) {
 	n := len(b.subs)
 	b.mu.Unlock()
 	setListenerCount(n)
+	return n
 }
 
 // publish sends ev to every current subscriber, dropping events for
@@ -139,8 +141,14 @@ func (b *KeyBroker) publish(ev KeyEvent) {
 type Server struct {
 	broker *KeyBroker
 
-	// filterMu protects filterProcs, the Go-side mirror of the C filter.
-	filterMu    sync.RWMutex
+	// filterMu protects pendingFilter.
+	// pendingFilter is the filter that will be applied to the NEXT open of
+	// the keys file; it does not affect already-open subscriptions.
+	// The C-side filter is pushed at open time and cleared when the last
+	// subscription closes.
+	filterMu      sync.RWMutex
+	pendingFilter []string
+	// filterProcs mirrors the last value pushed to C (for reads).
 	filterProcs []string
 }
 
@@ -148,19 +156,20 @@ func newServer(broker *KeyBroker) *Server {
 	return &Server{broker: broker}
 }
 
-// filterSnapshot returns a newline-terminated snapshot of the current filter.
+// filterSnapshot returns a newline-terminated snapshot of the pending filter.
 func (s *Server) filterSnapshot() []byte {
 	s.filterMu.RLock()
 	defer s.filterMu.RUnlock()
-	if len(s.filterProcs) == 0 {
+	if len(s.pendingFilter) == 0 {
 		return nil
 	}
-	return []byte(strings.Join(s.filterProcs, "\n") + "\n")
+	return []byte(strings.Join(s.pendingFilter, "\n") + "\n")
 }
 
-// applyFilter parses newline-separated process names from data, updates the
-// Go-side state, and pushes the change down to the C event tap.
-func (s *Server) applyFilter(data []byte) {
+// setPendingFilter parses newline-separated process names and stores them as
+// the pending filter.  The C event tap is NOT updated here; the filter takes
+// effect on the next open of the keys file.
+func (s *Server) setPendingFilter(data []byte) {
 	var names []string
 	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
 		if line = strings.TrimSpace(line); line != "" {
@@ -168,9 +177,27 @@ func (s *Server) applyFilter(data []byte) {
 		}
 	}
 	s.filterMu.Lock()
+	s.pendingFilter = names
+	s.filterMu.Unlock()
+}
+
+// activateFilter pushes the pending filter to the C event tap.
+// Called when a keys file subscription opens.
+func (s *Server) activateFilter() {
+	s.filterMu.Lock()
+	names := s.pendingFilter
 	s.filterProcs = names
 	s.filterMu.Unlock()
-	setFilter(names) // pushes to C
+	setFilter(names)
+}
+
+// deactivateFilter clears the C event tap filter when the last subscriber
+// closes.  The pending filter is preserved for the next open.
+func (s *Server) deactivateFilter() {
+	s.filterMu.Lock()
+	s.filterProcs = nil
+	s.filterMu.Unlock()
+	setFilter(nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -390,10 +417,13 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 
 	case ftKeys:
 		// Subscribe to the broker so this fid receives future key events.
+		// activateFilter pushes the pending filter to C at open time so the
+		// filter write → keys open ordering is deterministic.
 		if mode == plan9.OREAD || mode == plan9.ORDWR {
 			id, ch := cn.srv.broker.subscribe()
 			f.subID = id
 			f.keyCh = ch
+			cn.srv.activateFilter()
 		}
 
 	case ftFilter:
@@ -545,11 +575,17 @@ func (cn *conn) doClunk(fc *plan9.Fcall) *plan9.Fcall {
 	if f != nil && f.open {
 		if f.keyCh != nil {
 			// Wake any goroutine blocked in doRead.
-			cn.srv.broker.unsubscribe(f.subID)
+			remaining := cn.srv.broker.unsubscribe(f.subID)
+			if remaining == 0 {
+				// Last subscriber gone: clear the C filter so the tap
+				// passes everything through until the next open.
+				cn.srv.deactivateFilter()
+			}
 		}
 		if f.ft == ftFilter && f.mode&3 != plan9.OREAD && len(f.wbuf) > 0 {
-			// Apply the accumulated filter atomically on close.
-			cn.srv.applyFilter(f.wbuf)
+			// Store accumulated bytes as pending filter; takes effect
+			// on the next open of the keys file, not immediately.
+			cn.srv.setPendingFilter(f.wbuf)
 		}
 	}
 	delete(cn.fids, fc.Fid)
