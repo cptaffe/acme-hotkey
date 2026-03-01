@@ -1,0 +1,127 @@
+# hotkeys.cawk — dispatch acme hotkeys from the acme-hotkey keys stream.
+#
+# Run via launchd (zip.connor.acme-hotkeys) or manually:
+#
+#   9p read acme-hotkey/keys | cawk -f hotkeys.cawk
+#
+# Each line is the current set of held keys, space-separated, modifiers first:
+#
+#   command s          ← ⌘S held       (keydown)
+#   command            ← S released    (modifier-only, discarded)
+#                      ← all released  (empty, discarded)
+#
+# Recognised combinations are dispatched to acme via 9P directly:
+#   - Put/Get/Del/Delete  → ctl write on the focused window
+#   - New                 → open acme/new/ctl (creates a window as a side effect)
+#   - Putall              → ctl "put" on every modified window via acme/index
+#   - everything else     → exec'd as an external program with $winid set
+#
+# Unrecognised keydown lines are written back to acme-hotkey for re-injection.
+# Modifier-only and empty lines are discarded (those events were never swallowed).
+#
+# ── Keytab (from acme.c) ─────────────────────────────────────────────────────
+#   ⌘S            command s             Put
+#   ⌘⇧S           command shift s       Putall
+#   ⌘⇧F           command shift f       Look
+#   ⌘W            command w             Del
+#   ⌘⇧W           command shift w       Delcol
+#   ⌘N            command n             New
+#   ⌘⇧N           command shift n       Newcol
+#   ⌘;            command semicolon     Spell
+#   ⌘T            command t             win
+#   ⌘B            command b             Ldef
+#   ⌘⇧B           command shift b       Lrefs
+#   Escape         escape               V
+#   ⌘P            command p             Search
+#   ⌘⇧H           command shift h       Highlight
+# ─────────────────────────────────────────────────────────────────────────────
+
+BEGIN {
+    ns = ENVIRON["NAMESPACE"]
+    if (ns == "") {
+        "namespace" | getline ns
+        close("namespace")
+    }
+    passthrough = "9p -a 'unix!" ns "/acme-hotkey' write keys"
+
+    # Restrict interception to the acme devdraw process.
+    print "devdraw" | "9p -a 'unix!" ns "/acme-hotkey' write filter"
+    close("9p -a 'unix!" ns "/acme-hotkey' write filter")
+
+    # Modifier token set — used to detect keydown vs state-only lines.
+    mods["command"] = 1
+    mods["shift"]   = 1
+    mods["control"] = 1
+    mods["option"]  = 1
+}
+
+# focused_win returns the window ID from acme-focused (0 if unavailable).
+function focused_win(    pipe, id) {
+    pipe = "9p read acme-focused/focus"
+    pipe | getline id
+    close(pipe)
+    return id + 0
+}
+
+# ctl writes a command to the focused window's ctl file via 9p.
+function ctl(winid, cmd) {
+    print cmd | ("9p write acme/" winid "/ctl")
+    close("9p write acme/" winid "/ctl")
+}
+
+# putall iterates acme's index and puts every modified non-directory window.
+function putall(    pipe, line, id, flags, nname, name) {
+    pipe = "9p read acme/index"
+    while ((pipe | getline line) > 0) {
+        # index format: id taglen bodylen isdir ismod nname name...
+        if (split(line, a) < 6) continue
+        id    = a[1] + 0
+        isdir = a[4] + 0
+        ismod = a[5] + 0
+        if (!isdir && ismod)
+            ctl(id, "put")
+    }
+    close(pipe)
+}
+
+# run dispatches an acme command for the focused window.
+function run(cmd,    winid) {
+    winid = focused_win()
+    if (winid == 0) return
+
+    if (cmd == "Put")    { ctl(winid, "put");    return }
+    if (cmd == "Get")    { ctl(winid, "get");    return }
+    if (cmd == "Del")    { ctl(winid, "del");    return }
+    if (cmd == "Delete") { ctl(winid, "delete"); return }
+    if (cmd == "New")    { system("9p read acme/new/ctl > /dev/null"); return }
+    if (cmd == "Putall") { putall(); return }
+
+    # External command: exec with $winid set so it knows which window to act on.
+    system("winid=" winid " " cmd)
+}
+
+# is_keydown returns 1 if $0 ends in a non-modifier token.
+function is_keydown(    last) {
+    last = $NF
+    return !(last in mods) && last != ""
+}
+
+# ── Acme built-in keytab ─────────────────────────────────────────────────────
+
+/^command s$/          { run("Put");       next }
+/^command shift s$/    { run("Putall");    next }
+/^command shift f$/    { run("Look");      next }
+/^command w$/          { run("Del");       next }
+/^command shift w$/    { run("Delcol");    next }
+/^command n$/          { run("New");       next }
+/^command shift n$/    { run("Newcol");    next }
+/^command semicolon$/  { run("Spell");     next }
+/^command t$/          { run("win");       next }
+/^command b$/          { run("Ldef");      next }
+/^command shift b$/    { run("Lrefs");     next }
+/^escape$/             { run("V");         next }
+/^command p$/          { run("Search");    next }
+/^command shift h$/    { run("Highlight"); next }
+
+# ── Pass unrecognised keydown lines back for re-injection ────────────────────
+{ if (is_keydown()) { printf "%s\n", $0 | passthrough; fflush(passthrough) } }
