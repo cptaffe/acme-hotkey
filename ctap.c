@@ -96,21 +96,17 @@ shouldInterceptEvent(CGEventRef event)
 /* ── Per-keycode intercept state ───────────────────────────────────────── */
 
 /*
- * intercepted[kc] — set when we CFRetain+swallow a keyDown and hand it to
- *   Go; cleared by forwardEvent/dropEvent once the ack arrives.
+ * intercepted[kc] — count of keyDown events (initial + auto-repeats) that
+ *   have been CFRetain'd and handed to Go but not yet ack'd.  Incremented
+ *   in the tap thread; decremented by forwardEvent/dropEvent in the Go
+ *   goroutine.  Using a count rather than a boolean ensures the buffered
+ *   keyUp is not released until every in-flight repeat has been ack'd.
  *
- * pendingKeyUp[kc] — if the hardware keyUp arrives while intercepted[kc] is
- *   still set (i.e. before the ack), we CFRetain it here so forwardEvent can
- *   post it afterwards.  dropEvent releases it silently.
- *
- * Both arrays are accessed from two threads (CFRunLoop tap thread and the Go
- * goroutine calling forwardEvent/dropEvent), but the access pattern is
- * race-free in practice: the tap thread writes intercepted=1 and Go clears
- * it; the tap thread writes pendingKeyUp and Go clears it.  The window where
- * a race could cause a missed suppression is smaller than any human key
- * press duration.
+ * pendingKeyUp[kc] — if the hardware keyUp arrives while intercepted[kc]>0
+ *   we CFRetain and store it here; it is released (forward or drop) only
+ *   when the count reaches zero.
  */
-static char       intercepted[256];
+static int        intercepted[256];
 static CGEventRef pendingKeyUp[256];
 
 static int
@@ -141,37 +137,41 @@ forwardEvent(uintptr_t eventPtr, unsigned short kc)
 	CGEventRef dn = (CGEventRef)eventPtr;
 	int idx = kc & 0xFF;
 
-	intercepted[idx] = 0;
-
 	CGEventSetIntegerValueField(dn, kCGEventSourceUserData, PASSTHROUGH_MAGIC);
 	CGEventPost(kCGAnnotatedSessionEventTap, dn);
 	CFRelease(dn);
 
-	if (pendingKeyUp[idx]) {
-		CGEventRef up = pendingKeyUp[idx];
-		pendingKeyUp[idx] = NULL;
-		CGEventSetIntegerValueField(up, kCGEventSourceUserData,
-		    PASSTHROUGH_MAGIC);
-		CGEventPost(kCGAnnotatedSessionEventTap, up);
-		CFRelease(up);
+	/* Release the buffered keyUp only when all in-flight events are ack'd. */
+	if (--intercepted[idx] <= 0) {
+		intercepted[idx] = 0;
+		if (pendingKeyUp[idx]) {
+			CGEventRef up = pendingKeyUp[idx];
+			pendingKeyUp[idx] = NULL;
+			CGEventSetIntegerValueField(up, kCGEventSourceUserData,
+			    PASSTHROUGH_MAGIC);
+			CGEventPost(kCGAnnotatedSessionEventTap, up);
+			CFRelease(up);
+		}
 	}
 }
 
 /*
  * dropEvent — cawk consumed this key as a hotkey.
- * Release the retained keyDown and any buffered keyUp without posting either.
+ * Release the retained event; discard buffered keyUp when count hits zero.
  */
 void
 dropEvent(uintptr_t eventPtr, unsigned short kc)
 {
 	int idx = kc & 0xFF;
 
-	intercepted[idx] = 0;
 	CFRelease((CGEventRef)eventPtr);
 
-	if (pendingKeyUp[idx]) {
-		CFRelease(pendingKeyUp[idx]);
-		pendingKeyUp[idx] = NULL;
+	if (--intercepted[idx] <= 0) {
+		intercepted[idx] = 0;
+		if (pendingKeyUp[idx]) {
+			CFRelease(pendingKeyUp[idx]);
+			pendingKeyUp[idx] = NULL;
+		}
 	}
 }
 
@@ -224,7 +224,7 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 		int isRepeat = (int)CGEventGetIntegerValueField(event,
 		    kCGKeyboardEventAutorepeat);
 
-		intercepted[kc & 0xFF] = 1;
+		intercepted[kc & 0xFF]++;
 		CFRetain(event);
 		goKeyDown((unsigned short)kc, flags, (uintptr_t)event, isRepeat);
 		return NULL;
