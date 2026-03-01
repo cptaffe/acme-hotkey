@@ -6,10 +6,7 @@ package main
 #include "ctap.h"
 */
 import "C"
-import (
-	"log"
-	"unsafe"
-)
+import "unsafe"
 
 // KeyEvent is a keyboard event published to the keys stream.
 // The original CGEventRef lives entirely in C's circular buffer; Go never
@@ -34,11 +31,9 @@ func goKeyDown(kc C.ushort, flags C.ulonglong) {
 	code := uint16(kc)
 	str := formatState(uint64(flags), []uint16{code})
 	ev := KeyEvent{KeyCode: code, Flags: uint64(flags), Str: str}
-	log.Printf("goKeyDown: %q", ev.Str)
 	select {
 	case eventStream <- ev:
 	default:
-		log.Printf("goKeyDown: eventStream full, dropping %q", ev.Str)
 		C.ackNext(0)
 	}
 }

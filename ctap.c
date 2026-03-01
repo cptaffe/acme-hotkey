@@ -60,9 +60,6 @@ shouldInterceptEvent(CGEventRef event)
 	for (int i = 0; i < nFilter; i++)
 		if (strcmp(name, filterProcs[i]) == 0) { ok = 1; break; }
 	pthread_mutex_unlock(&filterMu);
-	if (!ok)
-		fprintf(stderr, "acme-hotkey: filter miss: proc=\"%s\" nl=%d nf=%d\n",
-		    name, nl, nf);
 	return ok;
 }
 
@@ -120,8 +117,6 @@ ackNext(int forward)
 	}
 	PendingEntry e = gPending[gTail];
 	gTail = (gTail + 1) % PENDING_CAP;
-	fprintf(stderr, "acme-hotkey: ackNext forward=%d kc=0x%02x tail=%d head=%d\n",
-	    forward, (int)e.kc, gTail, gHead);
 
 	/* Check for remaining events for this keycode after advancing tail. */
 	int more = hasPendingForKey(e.kc);
@@ -198,7 +193,6 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 			pendingKeyUp[kc & 0xFF] = event;
 		}
 		pthread_mutex_unlock(&gPendMu);
-		fprintf(stderr, "acme-hotkey: keyup kc=0x%02x pending=%d\n", (int)kc, pending);
 		return pending ? NULL : event;
 	}
 
@@ -227,14 +221,11 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 		int next = (gHead + 1) % PENDING_CAP;
 		if (next == gTail) {
 			pthread_mutex_unlock(&gPendMu);
-			fprintf(stderr, "acme-hotkey: C buf full, passing kc=0x%02x through\n", (int)kc);
 			return event;
 		}
 		CFRetain(event);
 		gPending[gHead] = (PendingEntry){ event, (uint16_t)kc };
 		gHead = next;
-		fprintf(stderr, "acme-hotkey: queued kc=0x%02x head=%d tail=%d\n",
-		    (int)kc, gHead, gTail);
 		pthread_mutex_unlock(&gPendMu);
 
 		goKeyDown((unsigned short)kc, flags);
