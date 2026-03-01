@@ -1,4 +1,5 @@
 #include "ctap.h"
+#include <libproc.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -6,7 +7,6 @@
 /* Exported by CGo (//export in tap.go). */
 extern void goKeyDown(unsigned short keyCode, unsigned long long flags);
 extern void goKeyUp(unsigned short keyCode, unsigned long long flags);
-extern void goFlagsChanged(unsigned long long flags);
 
 static CFMachPortRef gTap;
 
@@ -48,13 +48,22 @@ addFilterProc(const char *name)
 }
 
 /*
- * shouldIntercept returns 1 if there is at least one active keys-file reader
- * and the current frontmost process matches the filter (or no filter is set).
- * Returning 0 when no one is listening ensures a dead/crashed cawk pipeline
- * never silently swallows input system-wide.
+ * PASSTHROUGH_MAGIC is stamped into kCGEventSourceUserData on every event
+ * we re-inject.  The tap checks this field first so our own injected events
+ * are returned immediately without re-processing, preventing infinite loops.
+ */
+#define PASSTHROUGH_MAGIC 0xACE50001LL
+
+/*
+ * shouldInterceptEvent returns 1 when there is at least one active reader
+ * and the event's annotated target process matches the filter.
+ *
+ * At kCGAnnotatedSessionEventTap the kernel has already resolved
+ * kCGEventTargetUnixProcessID to the exact receiving process — no
+ * NSWorkspace poll, no stale-cache problem.
  */
 static int
-shouldIntercept(void)
+shouldInterceptEvent(CGEventRef event)
 {
 	pthread_mutex_lock(&filterMu);
 	int nl = nListeners;
@@ -67,15 +76,16 @@ shouldIntercept(void)
 	if (nf == 0)
 		return 1;
 
-	const char *front = frontmostProcName();
+	pid_t pid = (pid_t)CGEventGetIntegerValueField(event,
+	    kCGEventTargetUnixProcessID);
+	char name[256];
+	name[0] = '\0';
+	proc_name((int)pid, name, (uint32_t)sizeof(name));
 
 	pthread_mutex_lock(&filterMu);
 	int ok = 0;
 	for (int i = 0; i < nFilter; i++) {
-		if (strcmp(front, filterProcs[i]) == 0) {
-			ok = 1;
-			break;
-		}
+		if (strcmp(name, filterProcs[i]) == 0) { ok = 1; break; }
 	}
 	pthread_mutex_unlock(&filterMu);
 	return ok;
@@ -134,11 +144,20 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 		return event;
 	}
 
+	/*
+	 * Re-injected events are stamped with PASSTHROUGH_MAGIC.  Pass them
+	 * straight through — no re-processing, no risk of infinite loops.
+	 * At kCGAnnotatedSessionEventTap our injected events re-enter the
+	 * same tap level, so this check must come first.
+	 */
+	if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) ==
+	    PASSTHROUGH_MAGIC)
+		return event;
+
 	flags = (unsigned long long)CGEventGetFlags(event);
 
 	if (type == kCGEventFlagsChanged) {
-		/* Modifier events always pass through; just inform Go. */
-		goFlagsChanged(flags);
+		/* Modifier-only events always pass through unchanged. */
 		return event;
 	}
 
@@ -149,38 +168,37 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 		if (isModifier(kc))
 			return event;
 
+		/*
+		 * Only intercept when Command is held or the key is Escape.
+		 * Plain typing and Shift-only combos pass through immediately —
+		 * no round-trip through cawk, no latency, no debounce damage.
+		 */
+#define kVK_Escape 0x35
+		if (!(flags & kCGEventFlagMaskCommand) && kc != kVK_Escape)
+			return event;
+
 		if (CGEventGetIntegerValueField(event,
 		    kCGKeyboardEventAutorepeat)) {
 			/*
 			 * Auto-repeat event.  Three cases:
 			 *
-			 *  1. We never swallowed this key (e.g. focus changed
-			 *     between keyDown and the first repeat, or the key
-			 *     was originally passed through): let it flow.
-			 *
-			 *  2. We swallowed it and cawk re-injected it
-			 *     (passthrough): let the repeat flow as well.
-			 *     Do NOT call CGEventPost here — posting from inside
-			 *     a tap callback re-enters the tap and creates an
-			 *     infinite event storm that blocks all input.
-			 *
-			 *  3. We swallowed it as a hotkey (no re-injection):
-			 *     keep suppressing — commands should not repeat.
+			 *  1. We never swallowed this key: let it flow.
+			 *  2. We swallowed it and cawk re-injected (passthrough):
+			 *     let the repeat flow too.
+			 *  3. We swallowed it as a hotkey: keep suppressing.
 			 */
 			if (!suppressed[kc & 0xFF])
 				return event;	/* case 1 */
-
 			if (passthrough[kc & 0xFF])
 				return event;	/* case 2 */
-
 			return NULL;		/* case 3 */
 		}
 
-		if (!shouldIntercept())
+		if (!shouldInterceptEvent(event))
 			return event;
 
 		suppressed[kc & 0xFF] = 1;
-		passthrough[kc & 0xFF] = 0;	/* reset on each fresh keyDown */
+		passthrough[kc & 0xFF] = 0;
 		goKeyDown((unsigned short)kc, flags);
 		return NULL;
 	}
@@ -219,8 +237,15 @@ startEventTap(void)
 	       CGEventMaskBit(kCGEventKeyUp)         |
 	       CGEventMaskBit(kCGEventFlagsChanged);
 
+	/*
+	 * kCGSessionEventTap: supports active (modifying) taps, runs after
+	 * the session event router so kCGEventTargetUnixProcessID is already
+	 * populated.  kCGAnnotatedSessionEventTap is passive-only and cannot
+	 * suppress events.  kCGHIDEventTap predates routing so target PID
+	 * is always 0 there.
+	 */
 	gTap = CGEventTapCreate(
-		kCGHIDEventTap,
+		kCGSessionEventTap,
 		kCGHeadInsertEventTap,
 		kCGEventTapOptionDefault,
 		mask,
@@ -258,6 +283,7 @@ reInjectKey(unsigned short kc, unsigned long long flags)
 
 	dn = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)kc, true);
 	CGEventSetFlags(dn, (CGEventFlags)flags);
+	CGEventSetIntegerValueField(dn, kCGEventSourceUserData, PASSTHROUGH_MAGIC);
 	CGEventPost(kCGAnnotatedSessionEventTap, dn);
 	CFRelease(dn);
 }

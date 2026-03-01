@@ -74,14 +74,7 @@ func goKeyUp(kc C.ushort, flags C.ulonglong) {
 	publish(code, uint64(flags), false)
 }
 
-// goFlagsChanged is called from C when the modifier state changes.
-// The event itself is passed through (not swallowed), so this is
-// informational only — no re-injection needed.
-//
-//export goFlagsChanged
-func goFlagsChanged(flags C.ulonglong) {
-	publish(0, uint64(flags), false)
-}
+
 
 // frontmostApp returns the BSD process name of the current frontmost
 // application (delegates to NSWorkspace in frontapp.m).
