@@ -4,14 +4,9 @@
 #include <stdio.h>
 #include <string.h>
 
-/*
- * goKeyDown is //export-ed from tap.go.
- * eventPtr is a CFRetained CGEventRef cast to uintptr_t; ownership transfers
- * to Go, which must call forwardEvent or dropEvent to release it.
- * isRepeat is non-zero for auto-repeat hardware events.
- */
+/* Exported by CGo (//export in tap.go). */
 extern void goKeyDown(unsigned short keyCode, unsigned long long flags,
-                      uintptr_t eventPtr, int isRepeat);
+                      int isRepeat);
 
 static CFMachPortRef gTap;
 
@@ -24,25 +19,17 @@ static int             nFilter    = 0;
 static int             nListeners = 0;
 static pthread_mutex_t filterMu   = PTHREAD_MUTEX_INITIALIZER;
 
-void
-setListenerCount(int n)
-{
+void setListenerCount(int n) {
 	pthread_mutex_lock(&filterMu);
 	nListeners = n;
 	pthread_mutex_unlock(&filterMu);
 }
-
-void
-clearFilter(void)
-{
+void clearFilter(void) {
 	pthread_mutex_lock(&filterMu);
 	nFilter = 0;
 	pthread_mutex_unlock(&filterMu);
 }
-
-void
-addFilterProc(const char *name)
-{
+void addFilterProc(const char *name) {
 	pthread_mutex_lock(&filterMu);
 	if (nFilter < MAX_FILTER) {
 		strncpy(filterProcs[nFilter], name, 255);
@@ -52,127 +39,126 @@ addFilterProc(const char *name)
 	pthread_mutex_unlock(&filterMu);
 }
 
-/*
- * PASSTHROUGH_MAGIC is stamped onto every event we re-inject so the tap
- * recognises and immediately passes them through, preventing re-entry loops.
- */
 #define PASSTHROUGH_MAGIC 0xACE50001LL
 
-/*
- * shouldInterceptEvent — returns 1 when there is at least one active reader
- * and the event's kernel-annotated target process matches the filter.
- * At kCGSessionEventTap kCGEventTargetUnixProcessID is already populated by
- * the session router, giving us the exact receiving process without any
- * NSWorkspace poll (which is stale on the tap thread).
- */
 static int
 shouldInterceptEvent(CGEventRef event)
 {
 	pthread_mutex_lock(&filterMu);
-	int nl = nListeners;
-	int nf = nFilter;
+	int nl = nListeners, nf = nFilter;
 	pthread_mutex_unlock(&filterMu);
 
-	if (nl == 0)
-		return 0;
-	if (nf == 0)
-		return 1;
+	if (nl == 0) return 0;
+	if (nf == 0) return 1;
 
 	pid_t pid = (pid_t)CGEventGetIntegerValueField(event,
 	    kCGEventTargetUnixProcessID);
-	char name[256];
-	name[0] = '\0';
+	char name[256]; name[0] = '\0';
 	proc_name((int)pid, name, (uint32_t)sizeof(name));
 
 	pthread_mutex_lock(&filterMu);
 	int ok = 0;
-	for (int i = 0; i < nFilter; i++) {
+	for (int i = 0; i < nFilter; i++)
 		if (strcmp(name, filterProcs[i]) == 0) { ok = 1; break; }
-	}
 	pthread_mutex_unlock(&filterMu);
 	return ok;
 }
 
-/* ── Per-keycode intercept state ───────────────────────────────────────── */
+/* ── Pending-event circular buffer ─────────────────────────────────────── */
 
 /*
- * intercepted[kc] — count of keyDown events (initial + auto-repeats) that
- *   have been CFRetain'd and handed to Go but not yet ack'd.  Incremented
- *   in the tap thread; decremented by forwardEvent/dropEvent in the Go
- *   goroutine.  Using a count rather than a boolean ensures the buffered
- *   keyUp is not released until every in-flight repeat has been ack'd.
+ * gPending is a circular buffer of CFRetained CGEventRefs waiting for
+ * write-back acks from the cawk pipeline.
  *
- * pendingKeyUp[kc] — if the hardware keyUp arrives while intercepted[kc]>0
- *   we CFRetain and store it here; it is released (forward or drop) only
- *   when the count reaches zero.
+ *   gHead  — next slot the tap thread writes into (producer).
+ *   gTail  — next slot ackNext() consumes (consumer, called from Go).
+ *
+ * Invariant: gHead == gTail means empty; a slot is occupied when gTail ≠ gHead.
+ * The buffer is considered full when (gHead+1)%CAP == gTail (one slot wasted).
+ *
+ * gPendMu serialises access.  It is held briefly in the tap callback and
+ * in ackNext(); it is never held while posting events (CFPost is async).
+ *
+ * pendingKeyUp[kc] stores a CFRetained hardware keyUp event that arrived
+ * while events for kc were still in the buffer.  ackNext() posts (or drops)
+ * it once hasPendingForKey() returns false.
  */
-static int        intercepted[256];
+
+#define PENDING_CAP 4096
+
+typedef struct { CGEventRef ref; uint16_t kc; } PendingEntry;
+
+static PendingEntry    gPending[PENDING_CAP];
+static int             gHead = 0, gTail = 0;
+static pthread_mutex_t gPendMu = PTHREAD_MUTEX_INITIALIZER;
+
 static CGEventRef pendingKeyUp[256];
+
+/* Must be called with gPendMu held. */
+static int
+hasPendingForKey(uint16_t kc)
+{
+	for (int i = gTail; i != gHead; i = (i + 1) % PENDING_CAP)
+		if (gPending[i].kc == kc) return 1;
+	return 0;
+}
+
+/*
+ * ackNext — called from Go for each write-back line received on the keys
+ * file.  Dequeues the oldest pending entry, forwards or drops it, then
+ * releases any buffered keyUp for that keycode if no more events remain.
+ */
+void
+ackNext(int forward)
+{
+	pthread_mutex_lock(&gPendMu);
+	if (gTail == gHead) {          /* spurious ack — nothing pending */
+		pthread_mutex_unlock(&gPendMu);
+		return;
+	}
+	PendingEntry e = gPending[gTail];
+	gTail = (gTail + 1) % PENDING_CAP;
+
+	/* Check for remaining events for this keycode after advancing tail. */
+	int more = hasPendingForKey(e.kc);
+	CGEventRef up = NULL;
+	if (!more && pendingKeyUp[e.kc & 0xFF]) {
+		up = pendingKeyUp[e.kc & 0xFF];
+		pendingKeyUp[e.kc & 0xFF] = NULL;
+	}
+	pthread_mutex_unlock(&gPendMu);
+
+	/* Post or release the keyDown (outside the lock — CGEventPost is safe). */
+	if (forward) {
+		CGEventSetIntegerValueField(e.ref, kCGEventSourceUserData,
+		    PASSTHROUGH_MAGIC);
+		CGEventPost(kCGAnnotatedSessionEventTap, e.ref);
+	}
+	CFRelease(e.ref);
+
+	/* Post or release the buffered keyUp with the same disposition. */
+	if (up) {
+		if (forward) {
+			CGEventSetIntegerValueField(up, kCGEventSourceUserData,
+			    PASSTHROUGH_MAGIC);
+			CGEventPost(kCGAnnotatedSessionEventTap, up);
+		}
+		CFRelease(up);
+	}
+}
+
+/* ── Modifier check ─────────────────────────────────────────────────────── */
 
 static int
 isModifier(CGKeyCode kc)
 {
 	switch (kc) {
-	case 0x37: case 0x36: /* Command L/R    */
-	case 0x38: case 0x3C: /* Shift L/R      */
-	case 0x3A: case 0x3D: /* Option L/R     */
-	case 0x3B: case 0x3E: /* Control L/R    */
-	case 0x39:             /* Caps Lock      */
-	case 0x3F:             /* fn             */
+	case 0x37: case 0x36: case 0x38: case 0x3C:
+	case 0x3A: case 0x3D: case 0x3B: case 0x3E:
+	case 0x39: case 0x3F:
 		return 1;
 	}
 	return 0;
-}
-
-/* ── Event disposition (called from Go) ────────────────────────────────── */
-
-/*
- * forwardEvent — cawk has decided to pass this key through.
- * Post the original keyDown (with PASSTHROUGH_MAGIC) and, if the hardware
- * keyUp already arrived, post that too.
- */
-void
-forwardEvent(uintptr_t eventPtr, unsigned short kc)
-{
-	CGEventRef dn = (CGEventRef)eventPtr;
-	int idx = kc & 0xFF;
-
-	CGEventSetIntegerValueField(dn, kCGEventSourceUserData, PASSTHROUGH_MAGIC);
-	CGEventPost(kCGAnnotatedSessionEventTap, dn);
-	CFRelease(dn);
-
-	/* Release the buffered keyUp only when all in-flight events are ack'd. */
-	if (--intercepted[idx] <= 0) {
-		intercepted[idx] = 0;
-		if (pendingKeyUp[idx]) {
-			CGEventRef up = pendingKeyUp[idx];
-			pendingKeyUp[idx] = NULL;
-			CGEventSetIntegerValueField(up, kCGEventSourceUserData,
-			    PASSTHROUGH_MAGIC);
-			CGEventPost(kCGAnnotatedSessionEventTap, up);
-			CFRelease(up);
-		}
-	}
-}
-
-/*
- * dropEvent — cawk consumed this key as a hotkey.
- * Release the retained event; discard buffered keyUp when count hits zero.
- */
-void
-dropEvent(uintptr_t eventPtr, unsigned short kc)
-{
-	int idx = kc & 0xFF;
-
-	CFRelease((CGEventRef)eventPtr);
-
-	if (--intercepted[idx] <= 0) {
-		intercepted[idx] = 0;
-		if (pendingKeyUp[idx]) {
-			CFRelease(pendingKeyUp[idx]);
-			pendingKeyUp[idx] = NULL;
-		}
-	}
 }
 
 /* ── CGEventTap callback ───────────────────────────────────────────────── */
@@ -189,7 +175,6 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 		return event;
 	}
 
-	/* Our own re-injected events carry PASSTHROUGH_MAGIC — let them fly. */
 	if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) ==
 	    PASSTHROUGH_MAGIC)
 		return event;
@@ -198,21 +183,23 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 		return event;
 
 	CGKeyCode          kc    = (CGKeyCode)CGEventGetIntegerValueField(
-	    event, kCGKeyboardEventKeycode);
+	                               event, kCGKeyboardEventKeycode);
 	unsigned long long flags = (unsigned long long)CGEventGetFlags(event);
 
 	if (type == kCGEventKeyUp) {
-		int idx = kc & 0xFF;
-		if (intercepted[idx]) {
+		pthread_mutex_lock(&gPendMu);
+		int pending = hasPendingForKey((uint16_t)kc);
+		if (pending) {
 			/*
-			 * The ack has not arrived yet.  Buffer this keyUp so
-			 * forwardEvent can post it at the right time.
+			 * In-flight events still exist for this keycode.
+			 * Buffer the keyUp; ackNext() will release it once
+			 * the last entry for this key is consumed.
 			 */
 			CFRetain(event);
-			pendingKeyUp[idx] = event;
-			return NULL;
+			pendingKeyUp[kc & 0xFF] = event;
 		}
-		return event;
+		pthread_mutex_unlock(&gPendMu);
+		return pending ? NULL : event;
 	}
 
 	if (type == kCGEventKeyDown) {
@@ -224,9 +211,19 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 		int isRepeat = (int)CGEventGetIntegerValueField(event,
 		    kCGKeyboardEventAutorepeat);
 
-		intercepted[kc & 0xFF]++;
+		pthread_mutex_lock(&gPendMu);
+		int next = (gHead + 1) % PENDING_CAP;
+		if (next == gTail) {
+			/* Buffer full — pass event through rather than blocking. */
+			pthread_mutex_unlock(&gPendMu);
+			return event;
+		}
 		CFRetain(event);
-		goKeyDown((unsigned short)kc, flags, (uintptr_t)event, isRepeat);
+		gPending[gHead] = (PendingEntry){ event, (uint16_t)kc };
+		gHead = next;
+		pthread_mutex_unlock(&gPendMu);
+
+		goKeyDown((unsigned short)kc, flags, isRepeat);
 		return NULL;
 	}
 
@@ -238,8 +235,8 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 void
 startEventTap(void)
 {
-	memset(intercepted,  0, sizeof intercepted);
 	memset(pendingKeyUp, 0, sizeof pendingKeyUp);
+	gHead = gTail = 0;
 
 	CGEventMask mask =
 	    CGEventMaskBit(kCGEventKeyDown) |
@@ -250,15 +247,12 @@ startEventTap(void)
 		kCGSessionEventTap,
 		kCGHeadInsertEventTap,
 		kCGEventTapOptionDefault,
-		mask,
-		tapCallback,
-		NULL);
+		mask, tapCallback, NULL);
 
 	if (!gTap) {
 		fprintf(stderr,
 		    "acme-hotkey: CGEventTapCreate failed\n"
-		    "  Grant Accessibility access:\n"
-		    "  System Settings → Privacy & Security → Accessibility\n");
+		    "  Grant Accessibility: System Settings → Privacy → Accessibility\n");
 		return;
 	}
 

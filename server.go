@@ -81,11 +81,6 @@ func dirContent() []byte {
 
 // Server holds shared state across all connections.
 type Server struct {
-	// keys ack queue: events that have been read by the consumer and are
-	// waiting for a write-back ack.  Protected by ackMu.
-	ackMu    sync.Mutex
-	ackQueue []KeyEvent
-
 	// keysReaderOpen enforces a single simultaneous OREAD on the keys file,
 	// matching Acme's one-listener-at-a-time event-file semantics.
 	keysReaderMu   sync.Mutex
@@ -136,23 +131,10 @@ func (s *Server) deactivateFilter() {
 }
 
 // ackLine processes one write-back line from the cawk pipeline.
-// Lines without a leading '!' → forwardEvent (original event re-posted).
-// Lines with a leading '!'   → dropEvent    (original event consumed).
+// Lines without a leading '!' → forward the original CGEventRef.
+// Lines with a leading '!'   → drop it (hotkey consumed).
 func (s *Server) ackLine(line string) {
-	s.ackMu.Lock()
-	if len(s.ackQueue) == 0 {
-		s.ackMu.Unlock()
-		return
-	}
-	ev := s.ackQueue[0]
-	s.ackQueue = s.ackQueue[1:]
-	s.ackMu.Unlock()
-
-	if strings.HasPrefix(line, "!") {
-		dropEvent(ev)
-	} else {
-		forwardEvent(ev)
-	}
+	ackNext(!strings.HasPrefix(line, "!"))
 }
 
 // ---------------------------------------------------------------------------
@@ -429,9 +411,10 @@ func (cn *conn) doRead(fc *plan9.Fcall) {
 			case ev, ok := <-eventStream:
 				select {
 				case <-ctx.Done():
-					// Flush cancelled; release the event immediately.
+					// Flushed before reply — advance C buffer so it
+					// doesn't stall (the event was already enqueued there).
 					if ok {
-						dropEvent(ev)
+						ackNext(false)
 					}
 					return
 				default:
@@ -439,12 +422,8 @@ func (cn *conn) doRead(fc *plan9.Fcall) {
 				if !ok {
 					return
 				}
-				// Push to ack queue before replying — the write-back must
-				// dequeue in the same order events were delivered.
-				cn.srv.ackMu.Lock()
-				cn.srv.ackQueue = append(cn.srv.ackQueue, ev)
-				cn.srv.ackMu.Unlock()
-
+				// The event is already in C's circular buffer; Go only
+				// needs the string to hand to the cawk consumer.
 				data := []byte(ev.Str + "\n")
 				if uint32(len(data)) > count {
 					data = data[:count]

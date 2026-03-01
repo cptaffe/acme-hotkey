@@ -1,12 +1,8 @@
 #pragma once
 #include <CoreGraphics/CoreGraphics.h>
-#include <stdint.h>
 
 void startEventTap(void);
-
-/* called from Go to dispose of a buffered original event */
-void forwardEvent(uintptr_t eventPtr, unsigned short kc);
-void dropEvent(uintptr_t eventPtr, unsigned short kc);
+void ackNext(int forward);   /* called from Go: 1=forward original, 0=drop */
 
 /* defined in frontapp.m */
 const char *frontmostProcName(void);
