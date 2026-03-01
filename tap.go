@@ -83,6 +83,12 @@ func goFlagsChanged(flags C.ulonglong) {
 	publish(0, uint64(flags), false)
 }
 
+// frontmostApp returns the BSD process name of the current frontmost
+// application (delegates to NSWorkspace in frontapp.m).
+func frontmostApp() string {
+	return C.GoString(C.frontmostProcName())
+}
+
 // setFilter replaces the active process-name filter.  An empty slice means
 // intercept all applications.  Names are BSD process names as returned by
 // proc_name(3) — typically the executable basename, e.g. "devdraw".

@@ -16,9 +16,10 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	ftRoot   = uint64(0)
-	ftKeys   = uint64(1)
-	ftFilter = uint64(2)
+	ftRoot      = uint64(0)
+	ftKeys      = uint64(1)
+	ftFilter    = uint64(2)
+	ftFrontmost = uint64(3)
 )
 
 func makeQID(ft uint64) plan9.Qid {
@@ -53,6 +54,13 @@ func makeDir(ft uint64) plan9.Dir {
 			Atime: now, Mtime: now,
 			Name: "filter", Uid: "none", Gid: "none", Muid: "none",
 		}
+	case ftFrontmost:
+		return plan9.Dir{
+			Qid:   makeQID(ftFrontmost),
+			Mode:  0444,
+			Atime: now, Mtime: now,
+			Name: "frontmost", Uid: "none", Gid: "none", Muid: "none",
+		}
 	}
 	panic("makeDir: unknown ft")
 }
@@ -60,7 +68,7 @@ func makeDir(ft uint64) plan9.Dir {
 // dirContent returns the marshalled Dir entries for the root directory listing.
 func dirContent() []byte {
 	var out []byte
-	for _, ft := range []uint64{ftKeys, ftFilter} {
+	for _, ft := range []uint64{ftKeys, ftFilter, ftFrontmost} {
 		d := makeDir(ft)
 		b, _ := d.Bytes()
 		out = append(out, b...)
@@ -335,6 +343,8 @@ func (cn *conn) doWalk(fc *plan9.Fcall) *plan9.Fcall {
 			nextFt = ftKeys
 		case curFt == ftRoot && name == "filter":
 			nextFt = ftFilter
+		case curFt == ftRoot && name == "frontmost":
+			nextFt = ftFrontmost
 		default:
 			if i == 0 {
 				return rerr(fc.Tag, "no such file")
@@ -387,6 +397,16 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 		// served with standard buffered reads.
 		if mode == plan9.OREAD {
 			f.buf = cn.srv.filterSnapshot()
+		}
+
+	case ftFrontmost:
+		if mode != plan9.OREAD {
+			return rerr(fc.Tag, "read only")
+		}
+		// Sample the frontmost app name at open time.
+		name := frontmostApp()
+		if name != "" {
+			f.buf = []byte(name + "\n")
 		}
 	}
 
