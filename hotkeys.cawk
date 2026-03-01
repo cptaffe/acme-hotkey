@@ -2,24 +2,24 @@
 #
 # Run via launchd (zip.connor.acme-hotkeys) or manually:
 #
-#   9p read acme-hotkey/keys | cawk -f hotkeys.cawk
+#   9p read acme-hotkey/keys | cawk -f hotkeys.cawk | 9p write acme-hotkey/keys
 #
-# Each line is the current set of held keys, space-separated, modifiers first:
+# The keys file works like Acme's event file: reading delivers one event per
+# line; writing back acknowledges it.  Write-backs decide the event's fate:
 #
-#   command s          ← ⌘S held       (keydown)
-#   command            ← S released    (modifier-only, discarded)
-#                      ← all released  (empty, discarded)
+#   print $0        → forward: original event re-posted to the application
+#   print "!" $0   → drop:    original event consumed (hotkey handled here)
 #
-# Recognised combinations are dispatched to acme via 9P directly:
-#   - Put/Get/Del/Delete  → ctl write on the focused window
-#   - New                 → open acme/new/ctl (creates a window as a side effect)
-#   - Putall              → ctl "put" on every modified window via acme/index
-#   - everything else     → exec'd as an external program with $winid set
+# Lines prefixed with "repeat " are auto-repeat events; hotkey patterns do
+# not match them, so they are always forwarded.
 #
-# Unrecognised keydown lines are written back to acme-hotkey for re-injection.
-# Modifier-only and empty lines are discarded (those events were never swallowed).
+# Event format (space-separated, modifiers first):
+#   command b          ⌘B (initial press)
+#   repeat command b   ⌘B (auto-repeat)
+#   shift a            ⇧A
+#   escape             Escape
 #
-# ── Keytab (from acme.c) ─────────────────────────────────────────────────────
+# ── Keytab ───────────────────────────────────────────────────────────────────
 #   ⌘S            command s             Put
 #   ⌘⇧S           command shift s       Putall
 #   ⌘⇧F           command shift f       Look
@@ -42,13 +42,6 @@ BEGIN {
         "namespace" | getline ns
         close("namespace")
     }
-    passthrough = "9p -a 'unix!" ns "/acme-hotkey' write keys"
-
-    # Modifier token set — used to detect keydown vs state-only lines.
-    mods["command"] = 1
-    mods["shift"]   = 1
-    mods["control"] = 1
-    mods["option"]  = 1
 }
 
 # focused_win returns the window ID from acme-focused, validated against the
@@ -61,7 +54,6 @@ function focused_win(    pipe, id, line, found) {
     if (id == 0) {
         return 0
     }
-    # Confirm the window still exists.
     found = 0
     pipe = "9p read acme/index"
     while ((pipe | getline line) > 0) {
@@ -76,23 +68,19 @@ function focused_win(    pipe, id, line, found) {
     return 0
 }
 
-# ctl writes a command to a window's ctl file via 9p.
 function ctl(winid, cmd) {
     print cmd | ("9p write acme/" winid "/ctl")
     close("9p write acme/" winid "/ctl")
 }
 
-# err writes a line to a window's errors file (shown in acme as tool output).
 function err(winid, msg) {
     print msg | ("9p write acme/" winid "/errors")
     close("9p write acme/" winid "/errors")
 }
 
-# putall iterates acme's index and puts every modified non-directory window.
-function putall(    pipe, line, id, isdir, ismod) {
+function putall(    pipe, line, a, id, isdir, ismod) {
     pipe = "9p read acme/index"
     while ((pipe | getline line) > 0) {
-        # index format: id taglen bodylen isdir ismod nname name...
         if (split(line, a) < 6) { continue }
         id    = a[1] + 0
         isdir = a[4] + 0
@@ -102,7 +90,6 @@ function putall(    pipe, line, id, isdir, ismod) {
     close(pipe)
 }
 
-# run dispatches an acme command for the focused window.
 function run(cmd,    winid, errpipe, runcmd, line) {
     winid = focused_win()
     if (winid == 0) { return }
@@ -114,7 +101,6 @@ function run(cmd,    winid, errpipe, runcmd, line) {
     if (cmd == "New")    { system("9p read acme/new/ctl > /dev/null"); return }
     if (cmd == "Putall") { putall(); return }
 
-    # External command: capture stdout+stderr and write to the window's errors file.
     errpipe = "9p write acme/" winid "/errors"
     runcmd  = "winid=" winid " " cmd " 2>&1"
     while ((runcmd | getline line) > 0) {
@@ -124,28 +110,23 @@ function run(cmd,    winid, errpipe, runcmd, line) {
     close(errpipe)
 }
 
-# is_keydown returns 1 if $0 ends in a non-modifier token.
-function is_keydown(    last) {
-    last = $NF
-    return !(last in mods) && last != ""
-}
-
 # ── Acme built-in keytab ─────────────────────────────────────────────────────
+# Hotkeys: run the command and print "!" $0 to drop the original event.
 
-/^command s$/          { run("Put");       next }
-/^command shift s$/    { run("Putall");    next }
-/^command shift f$/    { run("Look");      next }
-/^command w$/          { run("Del");       next }
-/^command shift w$/    { run("Delcol");    next }
-/^command n$/          { run("New");       next }
-/^command shift n$/    { run("Newcol");    next }
-/^command semicolon$/  { run("Spell");     next }
-/^command t$/          { run("win");       next }
-/^command b$/          { run("Ldef");      next }
-/^command shift b$/    { run("Lrefs");     next }
-/^escape$/             { run("V");         next }
-/^command p$/          { run("Search");    next }
-/^command shift h$/    { run("Highlight"); next }
+/^command s$/          { run("Put");       print "!" $0; fflush(); next }
+/^command shift s$/    { run("Putall");    print "!" $0; fflush(); next }
+/^command shift f$/    { run("Look");      print "!" $0; fflush(); next }
+/^command w$/          { run("Del");       print "!" $0; fflush(); next }
+/^command shift w$/    { run("Delcol");    print "!" $0; fflush(); next }
+/^command n$/          { run("New");       print "!" $0; fflush(); next }
+/^command shift n$/    { run("Newcol");    print "!" $0; fflush(); next }
+/^command semicolon$/  { run("Spell");     print "!" $0; fflush(); next }
+/^command t$/          { run("win");       print "!" $0; fflush(); next }
+/^command b$/          { run("Ldef");      print "!" $0; fflush(); next }
+/^command shift b$/    { run("Lrefs");     print "!" $0; fflush(); next }
+/^escape$/             { run("V");         print "!" $0; fflush(); next }
+/^command p$/          { run("Search");    print "!" $0; fflush(); next }
+/^command shift h$/    { run("Highlight"); print "!" $0; fflush(); next }
 
-# ── Pass unrecognised keydown lines back for re-injection ────────────────────
-{ if (is_keydown()) { printf "%s\n", $0 | passthrough; fflush(passthrough) } }
+# ── Default: forward all unmatched events back to the application ─────────────
+{ print $0; fflush() }

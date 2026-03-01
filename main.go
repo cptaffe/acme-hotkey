@@ -25,15 +25,6 @@ func main() {
 	fmt.Fprintln(os.Stderr, "acme-hotkey: listening on", srvPath)
 	fmt.Fprintf(os.Stderr, "acme-hotkey: 9p -a unix!%s read keys\n", srvPath)
 
-	broker := newKeyBroker()
-
-	// Pump CGEventTap events into the broker.
-	go func() {
-		for ev := range keyEventChan {
-			broker.publish(ev)
-		}
-	}()
-
 	// Start the CGEventTap run loop (blocks until process exits).
 	go startTap()
 
@@ -46,7 +37,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	srv := newServer(broker)
+	srv := newServer()
 	for {
 		c, err := l.Accept()
 		if err != nil {

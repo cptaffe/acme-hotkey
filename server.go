@@ -12,7 +12,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// QID path constants — we only have two nodes in the tree.
+// QID path constants
 // ---------------------------------------------------------------------------
 
 const (
@@ -65,7 +65,6 @@ func makeDir(ft uint64) plan9.Dir {
 	panic("makeDir: unknown ft")
 }
 
-// dirContent returns the marshalled Dir entries for the root directory listing.
 func dirContent() []byte {
 	var out []byte
 	for _, ft := range []uint64{ftKeys, ftFilter, ftFrontmost} {
@@ -77,86 +76,29 @@ func dirContent() []byte {
 }
 
 // ---------------------------------------------------------------------------
-// KeyBroker — fan-out from the tap goroutine to all open read fids.
-// ---------------------------------------------------------------------------
-
-// KeyBroker distributes KeyEvents to all current OREAD subscribers.
-type KeyBroker struct {
-	mu   sync.Mutex
-	subs map[uint64]chan KeyEvent
-	next uint64
-}
-
-func newKeyBroker() *KeyBroker {
-	return &KeyBroker{subs: make(map[uint64]chan KeyEvent)}
-}
-
-// subscribe creates a new subscription and returns its numeric ID and
-// the receive-only channel.  Callers must eventually call unsubscribe.
-func (b *KeyBroker) subscribe() (id uint64, ch <-chan KeyEvent) {
-	b.mu.Lock()
-	b.next++
-	id = b.next
-	c := make(chan KeyEvent, 64)
-	b.subs[id] = c
-	n := len(b.subs)
-	b.mu.Unlock()
-	setListenerCount(n)
-	return id, c
-}
-
-// unsubscribe cancels the subscription and closes the channel so any
-// goroutine blocked on it wakes up and can detect the closure.
-// unsubscribe cancels the subscription and returns the remaining count.
-func (b *KeyBroker) unsubscribe(id uint64) int {
-	b.mu.Lock()
-	if ch, ok := b.subs[id]; ok {
-		close(ch)
-		delete(b.subs, id)
-	}
-	n := len(b.subs)
-	b.mu.Unlock()
-	setListenerCount(n)
-	return n
-}
-
-// publish sends ev to every current subscriber, dropping events for
-// subscribers whose buffer is full.
-func (b *KeyBroker) publish(ev KeyEvent) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, ch := range b.subs {
-		select {
-		case ch <- ev:
-		default:
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// 9P server
+// Server
 // ---------------------------------------------------------------------------
 
 // Server holds shared state across all connections.
 type Server struct {
-	broker *KeyBroker
+	// keys ack queue: events that have been read by the consumer and are
+	// waiting for a write-back ack.  Protected by ackMu.
+	ackMu    sync.Mutex
+	ackQueue []KeyEvent
 
-	// filterMu protects pendingFilter.
-	// pendingFilter is the filter that will be applied to the NEXT open of
-	// the keys file; it does not affect already-open subscriptions.
-	// The C-side filter is pushed at open time and cleared when the last
-	// subscription closes.
+	// keysReaderOpen enforces a single simultaneous OREAD on the keys file,
+	// matching Acme's one-listener-at-a-time event-file semantics.
+	keysReaderMu   sync.Mutex
+	keysReaderOpen bool
+
+	// filter state
 	filterMu      sync.RWMutex
 	pendingFilter []string
-	// filterProcs mirrors the last value pushed to C (for reads).
-	filterProcs []string
+	filterProcs   []string
 }
 
-func newServer(broker *KeyBroker) *Server {
-	return &Server{broker: broker}
-}
+func newServer() *Server { return &Server{} }
 
-// filterSnapshot returns a newline-terminated snapshot of the pending filter.
 func (s *Server) filterSnapshot() []byte {
 	s.filterMu.RLock()
 	defer s.filterMu.RUnlock()
@@ -166,9 +108,6 @@ func (s *Server) filterSnapshot() []byte {
 	return []byte(strings.Join(s.pendingFilter, "\n") + "\n")
 }
 
-// setPendingFilter parses newline-separated process names and stores them as
-// the pending filter.  The C event tap is NOT updated here; the filter takes
-// effect on the next open of the keys file.
 func (s *Server) setPendingFilter(data []byte) {
 	var names []string
 	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
@@ -181,8 +120,6 @@ func (s *Server) setPendingFilter(data []byte) {
 	s.filterMu.Unlock()
 }
 
-// activateFilter pushes the pending filter to the C event tap.
-// Called when a keys file subscription opens.
 func (s *Server) activateFilter() {
 	s.filterMu.Lock()
 	names := s.pendingFilter
@@ -191,8 +128,6 @@ func (s *Server) activateFilter() {
 	setFilter(names)
 }
 
-// deactivateFilter clears the C event tap filter when the last subscriber
-// closes.  The pending filter is preserved for the next open.
 func (s *Server) deactivateFilter() {
 	s.filterMu.Lock()
 	s.filterProcs = nil
@@ -200,41 +135,49 @@ func (s *Server) deactivateFilter() {
 	setFilter(nil)
 }
 
+// ackLine processes one write-back line from the cawk pipeline.
+// Lines without a leading '!' → forwardEvent (original event re-posted).
+// Lines with a leading '!'   → dropEvent    (original event consumed).
+func (s *Server) ackLine(line string) {
+	s.ackMu.Lock()
+	if len(s.ackQueue) == 0 {
+		s.ackMu.Unlock()
+		return
+	}
+	ev := s.ackQueue[0]
+	s.ackQueue = s.ackQueue[1:]
+	s.ackMu.Unlock()
+
+	if strings.HasPrefix(line, "!") {
+		dropEvent(ev)
+	} else {
+		forwardEvent(ev)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Per-connection state
 // ---------------------------------------------------------------------------
 
-// fid is the per-fid state, mirroring acme-styles' fid struct.
 type fid struct {
 	ft   uint64
 	open bool
 	mode uint8
-
-	// Buffered content for directory reads (set at Topen).
-	buf []byte
-
-	// Accumulated write bytes for the keys file.
-	wbuf []byte
-
-	// Non-nil when the keys file is opened OREAD / ORDWR.
-	subID uint64
-	keyCh <-chan KeyEvent
+	buf  []byte // buffered content for dir / filter reads
+	wbuf []byte // accumulated write bytes
 }
 
-// conn is the per-connection state, mirroring acme-styles' conn struct.
 type conn struct {
-	srv   *Server
-	c     net.Conn
-	fids  map[uint32]*fid
-	msize uint32
-
-	// Pending blocking Treads: tag → cancel function.
-	// Protected by pendMu; goroutines spawned by doRead update this.
+	srv     *Server
+	c       net.Conn
+	fids    map[uint32]*fid
+	msize   uint32
 	pendMu  sync.Mutex
 	pending map[uint16]context.CancelFunc
+	wmu     sync.Mutex
 
-	// Serialises all writes to c so goroutines don't race.
-	wmu sync.Mutex
+	// isKeysReader is true if this connection opened keys for OREAD.
+	isKeysReader bool
 }
 
 // ---------------------------------------------------------------------------
@@ -254,13 +197,23 @@ func (s *Server) handleConn(c net.Conn) {
 		fc, err := plan9.ReadFcall(c)
 		if err != nil {
 			cn.cancelAll()
+			if cn.isKeysReader {
+				cn.srv.releaseKeysReader()
+			}
 			return
 		}
 		cn.dispatch(fc)
 	}
 }
 
-// send writes a response, serialised via wmu.
+func (s *Server) releaseKeysReader() {
+	s.keysReaderMu.Lock()
+	s.keysReaderOpen = false
+	s.keysReaderMu.Unlock()
+	setListenerCount(0)
+	s.deactivateFilter()
+}
+
 func (cn *conn) send(resp *plan9.Fcall) {
 	cn.wmu.Lock()
 	defer cn.wmu.Unlock()
@@ -271,7 +224,6 @@ func rerr(tag uint16, msg string) *plan9.Fcall {
 	return &plan9.Fcall{Type: plan9.Rerror, Tag: tag, Ename: msg}
 }
 
-// cancelAll cancels any in-flight blocking reads; called on disconnect.
 func (cn *conn) cancelAll() {
 	cn.pendMu.Lock()
 	defer cn.pendMu.Unlock()
@@ -280,9 +232,6 @@ func (cn *conn) cancelAll() {
 	}
 }
 
-// dispatch routes an incoming Fcall.  It follows the same structure as
-// acme-styles; the only addition is that Tread on the keys file spawns a
-// goroutine so Tflush can arrive while a read is outstanding.
 func (cn *conn) dispatch(fc *plan9.Fcall) {
 	switch fc.Type {
 	case plan9.Tversion:
@@ -300,7 +249,7 @@ func (cn *conn) dispatch(fc *plan9.Fcall) {
 	case plan9.Tcreate:
 		cn.send(rerr(fc.Tag, "create not supported"))
 	case plan9.Tread:
-		cn.doRead(fc) // may be async; does its own cn.send
+		cn.doRead(fc)
 	case plan9.Twrite:
 		cn.send(cn.doWrite(fc))
 	case plan9.Tclunk:
@@ -317,7 +266,7 @@ func (cn *conn) dispatch(fc *plan9.Fcall) {
 }
 
 // ---------------------------------------------------------------------------
-// Individual message handlers
+// Message handlers
 // ---------------------------------------------------------------------------
 
 func (cn *conn) doVersion(fc *plan9.Fcall) *plan9.Fcall {
@@ -326,7 +275,7 @@ func (cn *conn) doVersion(fc *plan9.Fcall) *plan9.Fcall {
 		msize = cn.msize
 	}
 	cn.msize = msize
-	cn.fids = make(map[uint32]*fid) // reset state on Tversion
+	cn.fids = make(map[uint32]*fid)
 	ver := "9P2000"
 	if !strings.HasPrefix(fc.Version, "9P2000") {
 		ver = "unknown"
@@ -339,10 +288,6 @@ func (cn *conn) doAttach(fc *plan9.Fcall) *plan9.Fcall {
 	return &plan9.Fcall{Type: plan9.Rattach, Tag: fc.Tag, Qid: makeQID(ftRoot)}
 }
 
-// doFlush cancels any pending blocking read with the given tag, then
-// replies immediately.  The blocked goroutine will see ctx.Done() and exit
-// without sending an Rread, satisfying the 9P rule that Rflush must arrive
-// before any response to the flushed tag.
 func (cn *conn) doFlush(fc *plan9.Fcall) {
 	cn.pendMu.Lock()
 	if cancel, ok := cn.pending[fc.Oldtag]; ok {
@@ -361,15 +306,13 @@ func (cn *conn) doWalk(fc *plan9.Fcall) *plan9.Fcall {
 	if f.open {
 		return rerr(fc.Tag, "fid is open")
 	}
-
 	curFt := f.ft
 	wqids := make([]plan9.Qid, 0, len(fc.Wname))
-
 	for i, name := range fc.Wname {
 		var nextFt uint64
 		switch {
 		case name == "..":
-			nextFt = ftRoot // at root ".." stays at root
+			nextFt = ftRoot
 		case curFt == ftRoot && name == "keys":
 			nextFt = ftKeys
 		case curFt == ftRoot && name == "filter":
@@ -380,17 +323,15 @@ func (cn *conn) doWalk(fc *plan9.Fcall) *plan9.Fcall {
 			if i == 0 {
 				return rerr(fc.Tag, "no such file")
 			}
-			// Partial walk: return as many qids as we resolved.
 			goto done
 		}
 		wqids = append(wqids, makeQID(nextFt))
 		curFt = nextFt
 	}
-
 done:
 	newf := &fid{ft: curFt}
 	if len(fc.Wname) == 0 {
-		newf.ft = f.ft // clone, same location
+		newf.ft = f.ft
 	}
 	if len(wqids) == len(fc.Wname) {
 		cn.fids[fc.Newfid] = newf
@@ -416,19 +357,22 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 		f.buf = dirContent()
 
 	case ftKeys:
-		// Subscribe to the broker so this fid receives future key events.
-		// activateFilter pushes the pending filter to C at open time so the
-		// filter write → keys open ordering is deterministic.
 		if mode == plan9.OREAD || mode == plan9.ORDWR {
-			id, ch := cn.srv.broker.subscribe()
-			f.subID = id
-			f.keyCh = ch
+			// Enforce single listener.
+			cn.srv.keysReaderMu.Lock()
+			if cn.srv.keysReaderOpen {
+				cn.srv.keysReaderMu.Unlock()
+				return rerr(fc.Tag, "keys already open for reading")
+			}
+			cn.srv.keysReaderOpen = true
+			cn.srv.keysReaderMu.Unlock()
+			cn.isKeysReader = true
+			setListenerCount(1)
 			cn.srv.activateFilter()
 		}
+		// OWRITE: no special setup; writes go to the global ack handler.
 
 	case ftFilter:
-		// For reads: snapshot the current filter into buf so it can be
-		// served with standard buffered reads.
 		if mode == plan9.OREAD {
 			f.buf = cn.srv.filterSnapshot()
 		}
@@ -437,9 +381,7 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 		if mode != plan9.OREAD {
 			return rerr(fc.Tag, "read only")
 		}
-		// Sample the frontmost app name at open time.
-		name := frontmostApp()
-		if name != "" {
+		if name := frontmostApp(); name != "" {
 			f.buf = []byte(name + "\n")
 		}
 	}
@@ -454,9 +396,9 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 	}
 }
 
-// doRead handles Tread.  For a keys fid opened for reading it spawns a
-// goroutine that blocks until the next key event (or a Tflush / disconnect).
-// All other reads are satisfied synchronously as in acme-styles.
+// doRead handles Tread.  Reading from keys blocks until the tap delivers a
+// key event, then pushes it to the global ack queue so the corresponding
+// write-back can dispose of the original CGEventRef.
 func (cn *conn) doRead(fc *plan9.Fcall) {
 	f := cn.fids[fc.Fid]
 	if f == nil {
@@ -468,19 +410,14 @@ func (cn *conn) doRead(fc *plan9.Fcall) {
 		return
 	}
 
-	// Streaming read from the keys file — block until a keystroke arrives.
-	if f.ft == ftKeys && f.keyCh != nil {
+	// Streaming read: block until a key event arrives.
+	if f.ft == ftKeys && cn.isKeysReader {
 		ctx, cancel := context.WithCancel(context.Background())
-
 		cn.pendMu.Lock()
 		cn.pending[fc.Tag] = cancel
 		cn.pendMu.Unlock()
 
-		// Capture locals for the goroutine.
-		keyCh := f.keyCh
-		tag := fc.Tag
-		count := fc.Count
-
+		tag, count := fc.Tag, fc.Count
 		go func() {
 			defer func() {
 				cn.pendMu.Lock()
@@ -488,20 +425,26 @@ func (cn *conn) doRead(fc *plan9.Fcall) {
 				cn.pendMu.Unlock()
 				cancel()
 			}()
-
 			select {
-			case ev, ok := <-keyCh:
-				// Check whether a Tflush arrived between the event being
-				// received and us trying to reply.
+			case ev, ok := <-eventStream:
 				select {
 				case <-ctx.Done():
+					// Flush cancelled; release the event immediately.
+					if ok {
+						dropEvent(ev)
+					}
 					return
 				default:
 				}
 				if !ok {
-					// The channel was closed by doClunk; don't send anything.
 					return
 				}
+				// Push to ack queue before replying — the write-back must
+				// dequeue in the same order events were delivered.
+				cn.srv.ackMu.Lock()
+				cn.srv.ackQueue = append(cn.srv.ackQueue, ev)
+				cn.srv.ackMu.Unlock()
+
 				data := []byte(ev.Str + "\n")
 				if uint32(len(data)) > count {
 					data = data[:count]
@@ -509,13 +452,12 @@ func (cn *conn) doRead(fc *plan9.Fcall) {
 				cn.send(&plan9.Fcall{Type: plan9.Rread, Tag: tag, Data: data})
 
 			case <-ctx.Done():
-				// Cancelled by Tflush; Rflush already sent by doFlush.
 			}
 		}()
 		return
 	}
 
-	// Buffered read (directory listing or write-only fid returning EOF).
+	// Buffered read (directory listing, filter snapshot, frontmost).
 	off := fc.Offset
 	n := fc.Count
 	if off >= uint64(len(f.buf)) {
@@ -529,9 +471,11 @@ func (cn *conn) doRead(fc *plan9.Fcall) {
 	cn.send(&plan9.Fcall{Type: plan9.Rread, Tag: fc.Tag, Data: f.buf[off:end]})
 }
 
-// doWrite handles Twrite.  Writing to the keys file re-injects the named
-// keystroke.  Lines are accumulated across writes and processed one per '\n',
-// mirroring acme-styles' ctl file handling.
+// doWrite handles Twrite.
+// Writing to keys is a write-back ack: each newline-terminated line is either
+//   "!..." → dropEvent  (key consumed as hotkey)
+//   "..."  → forwardEvent (key passed through to the application)
+// Writing to filter accumulates the new filter (applied on next keys open).
 func (cn *conn) doWrite(fc *plan9.Fcall) *plan9.Fcall {
 	f := cn.fids[fc.Fid]
 	if f == nil {
@@ -540,51 +484,42 @@ func (cn *conn) doWrite(fc *plan9.Fcall) *plan9.Fcall {
 	if !f.open {
 		return rerr(fc.Tag, "not open")
 	}
-	if f.ft != ftKeys && f.ft != ftFilter {
+
+	switch f.ft {
+	case ftKeys:
+		// Accumulate and process complete lines.
+		f.wbuf = append(f.wbuf, fc.Data...)
+		for {
+			nl := bytes.IndexByte(f.wbuf, '\n')
+			if nl < 0 {
+				break
+			}
+			line := string(f.wbuf[:nl])
+			f.wbuf = f.wbuf[nl+1:]
+			if line == "" {
+				continue
+			}
+			cn.srv.ackLine(line)
+		}
+
+	case ftFilter:
+		f.wbuf = append(f.wbuf, fc.Data...)
+
+	default:
 		return rerr(fc.Tag, "not writable")
 	}
 
-	// Filter writes just accumulate — the filter is applied atomically at clunk.
-	if f.ft == ftFilter {
-		f.wbuf = append(f.wbuf, fc.Data...)
-		return &plan9.Fcall{Type: plan9.Rwrite, Tag: fc.Tag, Count: uint32(len(fc.Data))}
-	}
-
-	f.wbuf = append(f.wbuf, fc.Data...)
-	for {
-		nl := bytes.IndexByte(f.wbuf, '\n')
-		if nl < 0 {
-			break
-		}
-		line := strings.TrimSpace(string(f.wbuf[:nl]))
-		f.wbuf = f.wbuf[nl+1:]
-		if line == "" {
-			continue
-		}
-		ev, ok := parseKeyEvent(line)
-		if !ok {
-			continue // modifier-only or unknown state line — nothing to inject
-		}
-		reInjectKey(ev)
-	}
 	return &plan9.Fcall{Type: plan9.Rwrite, Tag: fc.Tag, Count: uint32(len(fc.Data))}
 }
 
 func (cn *conn) doClunk(fc *plan9.Fcall) *plan9.Fcall {
 	f := cn.fids[fc.Fid]
 	if f != nil && f.open {
-		if f.keyCh != nil {
-			// Wake any goroutine blocked in doRead.
-			remaining := cn.srv.broker.unsubscribe(f.subID)
-			if remaining == 0 {
-				// Last subscriber gone: clear the C filter so the tap
-				// passes everything through until the next open.
-				cn.srv.deactivateFilter()
-			}
+		if f.ft == ftKeys && cn.isKeysReader {
+			cn.isKeysReader = false
+			cn.srv.releaseKeysReader()
 		}
 		if f.ft == ftFilter && f.mode&3 != plan9.OREAD && len(f.wbuf) > 0 {
-			// Store accumulated bytes as pending filter; takes effect
-			// on the next open of the keys file, not immediately.
 			cn.srv.setPendingFilter(f.wbuf)
 		}
 	}
