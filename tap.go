@@ -1,7 +1,7 @@
 package main
 
 /*
-#cgo LDFLAGS: -framework Carbon -framework CoreGraphics -framework CoreFoundation
+#cgo LDFLAGS: -framework Carbon -framework CoreGraphics -framework CoreFoundation -framework AppKit
 
 #include "ctap.h"
 */

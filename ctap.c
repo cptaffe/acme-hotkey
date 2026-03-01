@@ -1,5 +1,4 @@
 #include "ctap.h"
-#include <libproc.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -37,34 +36,6 @@ addFilterProc(const char *name)
 		nFilter++;
 	}
 	pthread_mutex_unlock(&filterMu);
-}
-
-/*
- * frontmostProcName returns the BSD process name of the currently focused
- * application by querying the Accessibility API (same permission that the
- * CGEventTap already requires).
- */
-static const char *
-frontmostProcName(void)
-{
-	static char name[256];
-	pid_t pid = 0;
-
-	AXUIElementRef sysWide = AXUIElementCreateSystemWide();
-	AXUIElementRef app = NULL;
-
-	if (AXUIElementCopyAttributeValue(sysWide,
-	    kAXFocusedApplicationAttribute, (CFTypeRef *)&app) == kAXErrorSuccess
-	    && app != NULL) {
-		AXUIElementGetPid(app, &pid);
-		CFRelease(app);
-	}
-	CFRelease(sysWide);
-
-	name[0] = '\0';
-	if (pid > 0)
-		proc_name((int)pid, name, sizeof(name));
-	return name;
 }
 
 /*
