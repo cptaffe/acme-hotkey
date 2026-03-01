@@ -10,21 +10,15 @@
 #   print $0          → forward: original event re-posted to the application
 #   printf "!%s", $0  → drop:    original event consumed (hotkey handled here)
 #
-# Execution model (new cawk x-expression semantics):
-#   Each top-level /re/ rule is an x-expression anchored at the current stream
-#   position.  The pattern includes the trailing \n so $0 = "command s\n".
-#   First matching rule wins; the stream advances by len($0), so later rules
-#   never see the same bytes.  The bare catch-all block { } consumes any line
-#   not matched above and gives $0 WITHOUT the trailing newline (AWK compat),
-#   so plain `print $0` re-emits the event correctly.
+# Execution model:
+#   cawk reads input line-by-line (standard AWK semantics).  $0 is each line
+#   WITHOUT the trailing newline.  Top-level /^re$/ patterns match $0 as usual.
 #
-# To drop a matched event: printf "!%s", $0
-#   (printf is used instead of print because $0 already contains the newline;
-#    print would add a second one via ORS.)
+# To drop a matched event: print "!" $0
+#   (print appends ORS="\n"; the server splits write-backs on "\n")
 #
-# Lines prefixed with "repeat " are auto-repeat events; they do not match any
-# hotkey pattern (which lack the "repeat " prefix) and fall through to the
-# catch-all, which forwards them unchanged.
+# To forward an event unchanged: print $0
+#   (same — print appends the required newline)
 #
 # Event format (space-separated, modifiers first):
 #   command b          ⌘B (initial press)
@@ -115,21 +109,20 @@ function run(cmd,    winid, errpipe, runcmd, line) {
 # its trailing newline.  $0 = "command s\n"; printf "!%s" re-emits it with the
 # leading "!" that signals the hotkey was consumed (no extra newline from ORS).
 
-/command s\n/          { run("Put");       printf "!%s", $0; fflush() }
-/command shift s\n/    { run("Putall");    printf "!%s", $0; fflush() }
-/command shift f\n/    { run("Look");      printf "!%s", $0; fflush() }
-/command w\n/          { run("Del");       printf "!%s", $0; fflush() }
-/command shift w\n/    { run("Delcol");    printf "!%s", $0; fflush() }
-/command n\n/          { run("New");       printf "!%s", $0; fflush() }
-/command shift n\n/    { run("Newcol");    printf "!%s", $0; fflush() }
-/command semicolon\n/  { run("Spell");     printf "!%s", $0; fflush() }
-/command t\n/          { run("win");       printf "!%s", $0; fflush() }
-/command b\n/          { run("Ldef");      printf "!%s", $0; fflush() }
-/command shift b\n/    { run("Lrefs");     printf "!%s", $0; fflush() }
-/escape\n/             { run("V");         printf "!%s", $0; fflush() }
-/command p\n/          { run("Search");    printf "!%s", $0; fflush() }
-/command shift h\n/    { run("Highlight"); printf "!%s", $0; fflush() }
+/^command s$/          { run("Put");       print "!" $0; fflush() }
+/^command shift s$/    { run("Putall");    print "!" $0; fflush() }
+/^command shift f$/    { run("Look");      print "!" $0; fflush() }
+/^command w$/          { run("Del");       print "!" $0; fflush() }
+/^command shift w$/    { run("Delcol");    print "!" $0; fflush() }
+/^command n$/          { run("New");       print "!" $0; fflush() }
+/^command shift n$/    { run("Newcol");    print "!" $0; fflush() }
+/^command semicolon$/  { run("Spell");     print "!" $0; fflush() }
+/^command t$/          { run("win");       print "!" $0; fflush() }
+/^command b$/          { run("Ldef");      print "!" $0; fflush() }
+/^command shift b$/    { run("Lrefs");     print "!" $0; fflush() }
+/^escape$/             { run("V");         print "!" $0; fflush() }
+/^command p$/          { run("Search");    print "!" $0; fflush() }
+/^command shift h$/    { run("Highlight"); print "!" $0; fflush() }
 
 # ── Default: forward all unmatched events back to the application ─────────────
-# Bare block: $0 = line WITHOUT trailing newline; print adds ORS (\n).
 { print $0; fflush() }
