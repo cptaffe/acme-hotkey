@@ -14,6 +14,7 @@ sign:
 	  --timestamp=none "$(BINARY)"
 
 restart:
-	launchctl kickstart -k gui/$$(id -u)/zip.connor.acme-hotkey
+	launchctl unload $(HOME)/Library/LaunchAgents/zip.connor.acme-hotkey.plist 2>/dev/null; true
+	launchctl load  $(HOME)/Library/LaunchAgents/zip.connor.acme-hotkey.plist
 
 deploy: install restart

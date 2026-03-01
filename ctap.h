@@ -9,3 +9,4 @@ const char *frontmostProcName(void);
 
 void clearFilter(void);
 void addFilterProc(const char *name);
+void setListenerCount(int n);

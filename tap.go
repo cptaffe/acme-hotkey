@@ -89,6 +89,13 @@ func frontmostApp() string {
 	return C.GoString(C.frontmostProcName())
 }
 
+// setListenerCount tells the C tap how many goroutines are actively reading
+// the keys file.  When the count is zero the tap passes all events through
+// unconditionally, so a dead cawk pipeline never blocks input system-wide.
+func setListenerCount(n int) {
+	C.setListenerCount(C.int(n))
+}
+
 // setFilter replaces the active process-name filter.  An empty slice means
 // intercept all applications.  Names are BSD process names as returned by
 // proc_name(3) — typically the executable basename, e.g. "devdraw".

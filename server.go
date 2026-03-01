@@ -95,11 +95,13 @@ func newKeyBroker() *KeyBroker {
 // the receive-only channel.  Callers must eventually call unsubscribe.
 func (b *KeyBroker) subscribe() (id uint64, ch <-chan KeyEvent) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.next++
 	id = b.next
 	c := make(chan KeyEvent, 64)
 	b.subs[id] = c
+	n := len(b.subs)
+	b.mu.Unlock()
+	setListenerCount(n)
 	return id, c
 }
 
@@ -107,11 +109,13 @@ func (b *KeyBroker) subscribe() (id uint64, ch <-chan KeyEvent) {
 // goroutine blocked on it wakes up and can detect the closure.
 func (b *KeyBroker) unsubscribe(id uint64) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if ch, ok := b.subs[id]; ok {
 		close(ch)
 		delete(b.subs, id)
 	}
+	n := len(b.subs)
+	b.mu.Unlock()
+	setListenerCount(n)
 }
 
 // publish sends ev to every current subscriber, dropping events for

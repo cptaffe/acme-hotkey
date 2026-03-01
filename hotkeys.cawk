@@ -57,17 +57,26 @@ BEGIN {
 
 # focused_win returns the window ID from acme-focused, validated against the
 # live acme index.  Returns 0 if unavailable or if the window no longer exists.
-function focused_win(    pipe, id, line) {
+function focused_win(    pipe, id, line, found) {
     pipe = "9p read acme-focused/focus"
     pipe | getline id
     close(pipe)
     id = id + 0
-    if (id == 0) return 0
+    if (id == 0) {
+        return 0
+    }
     # Confirm the window still exists.
+    found = 0
     pipe = "9p read acme/index"
-    while ((pipe | getline line) > 0)
-        if ((line + 0) == id) { close(pipe); return id }
+    while ((pipe | getline line) > 0) {
+        if ((line + 0) == id) {
+            found = 1
+        }
+    }
     close(pipe)
+    if (found) {
+        return id
+    }
     return 0
 }
 
@@ -84,24 +93,23 @@ function err(winid, msg) {
 }
 
 # putall iterates acme's index and puts every modified non-directory window.
-function putall(    pipe, line, id, flags, nname, name) {
+function putall(    pipe, line, id, isdir, ismod) {
     pipe = "9p read acme/index"
     while ((pipe | getline line) > 0) {
         # index format: id taglen bodylen isdir ismod nname name...
-        if (split(line, a) < 6) continue
+        if (split(line, a) < 6) { continue }
         id    = a[1] + 0
         isdir = a[4] + 0
         ismod = a[5] + 0
-        if (!isdir && ismod)
-            ctl(id, "put")
+        if (!isdir && ismod) { ctl(id, "put") }
     }
     close(pipe)
 }
 
 # run dispatches an acme command for the focused window.
-function run(cmd,    winid) {
+function run(cmd,    winid, errpipe, runcmd, line) {
     winid = focused_win()
-    if (winid == 0) return
+    if (winid == 0) { return }
 
     if (cmd == "Put")    { ctl(winid, "put");    return }
     if (cmd == "Get")    { ctl(winid, "get");    return }
@@ -113,8 +121,9 @@ function run(cmd,    winid) {
     # External command: capture stdout+stderr and write to the window's errors file.
     errpipe = "9p write acme/" winid "/errors"
     runcmd  = "winid=" winid " " cmd " 2>&1"
-    while ((runcmd | getline line) > 0)
+    while ((runcmd | getline line) > 0) {
         print line | errpipe
+    }
     close(runcmd)
     close(errpipe)
 }
