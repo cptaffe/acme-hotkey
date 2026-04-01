@@ -189,11 +189,24 @@ func (s *Server) handleConn(c net.Conn) {
 }
 
 func (s *Server) releaseKeysReader() {
+	// Hold keysReaderMu for the entire cleanup sequence.
+	//
+	// The doOpen polling loop (below) spins waiting for keysReaderOpen to
+	// become false.  By keeping the mutex locked until every side-effect
+	// (setListenerCount, drainPending, filter clear) is done, we guarantee
+	// that the new reader sees a fully clean slate the moment it escapes the
+	// loop — no races between our setListenerCount(0) and its
+	// setListenerCount(1), and no stale gPending entries that would
+	// permanently offset the ack queue by one per crash-restart cycle.
 	s.keysReaderMu.Lock()
-	s.keysReaderOpen = false
+	setListenerCount(0) // stop tap interception first
+	drainPending()      // flush any C-side events queued before the tap stopped
+	s.filterMu.Lock()
+	s.filterProcs = nil
+	s.filterMu.Unlock()
+	setFilter(nil)
+	s.keysReaderOpen = false // set last: polling loop exits only after clean state
 	s.keysReaderMu.Unlock()
-	setListenerCount(0)
-	s.deactivateFilter()
 }
 
 func (cn *conn) send(resp *plan9.Fcall) {
@@ -340,14 +353,33 @@ func (cn *conn) doOpen(fc *plan9.Fcall) *plan9.Fcall {
 
 	case ftKeys:
 		if mode == plan9.OREAD || mode == plan9.ORDWR {
-			// Enforce single listener.
-			cn.srv.keysReaderMu.Lock()
-			if cn.srv.keysReaderOpen {
+			// Enforce single listener, but wait for any previous reader to
+			// finish its cleanup rather than erroring immediately.
+			//
+			// Without the wait, a rapid 9init restart (e.g. after SIGKILL)
+			// races with the handleConn goroutine that detects the closed
+			// socket and calls releaseKeysReader.  The new 9p read would hit
+			// "keys already open for reading" and exit before releaseKeysReader
+			// even ran, causing 6+ rapid crash-restart loops that exhaust the
+			// crash budget.
+			//
+			// releaseKeysReader holds keysReaderMu for its entire cleanup
+			// (setListenerCount, drainPending, filter clear, keysReaderOpen=false),
+			// so once we see keysReaderOpen==false we know the slate is clean.
+			deadline := time.Now().Add(500 * time.Millisecond)
+			for {
+				cn.srv.keysReaderMu.Lock()
+				if !cn.srv.keysReaderOpen {
+					cn.srv.keysReaderOpen = true
+					cn.srv.keysReaderMu.Unlock()
+					break
+				}
 				cn.srv.keysReaderMu.Unlock()
-				return rerr(fc.Tag, "keys already open for reading")
+				if time.Now().After(deadline) {
+					return rerr(fc.Tag, "keys already open for reading")
+				}
+				time.Sleep(10 * time.Millisecond)
 			}
-			cn.srv.keysReaderOpen = true
-			cn.srv.keysReaderMu.Unlock()
 			cn.isKeysReader = true
 			setListenerCount(1)
 			cn.srv.activateFilter()
