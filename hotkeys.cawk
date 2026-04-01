@@ -1,6 +1,6 @@
 # hotkeys.cawk — dispatch acme hotkeys from the acme-hotkey keys stream.
 #
-# Run via launchd (zip.connor.acme-hotkeys) or manually:
+# Run via 9init (acme-hotkeys) or manually:
 #
 #   9p read acme-hotkey/keys | cawk -f hotkeys.cawk | 9p write acme-hotkey/keys
 #
@@ -11,14 +11,16 @@
 #   printf "!%s", $0  → drop:    original event consumed (hotkey handled here)
 #
 # Execution model:
-#   cawk reads input line-by-line (standard AWK semantics).  $0 is each line
-#   WITHOUT the trailing newline.  Top-level /^re$/ patterns match $0 as usual.
+#   cawk uses x-expression semantics for top-level patterns.  Each /re\n/
+#   matches the event line including its trailing newline; $0 includes the \n.
+#   The implicit bare block { } sees $0 WITHOUT the trailing newline (AWK compat).
 #
-# To drop a matched event: print "!" $0
-#   (print appends ORS="\n"; the server splits write-backs on "\n")
+# To drop a matched event: printf "!%s", $0
+#   ($0 already contains \n; printf avoids the double-newline that print+ORS adds)
+#   cawk line-buffers stdout, so no fflush() is needed.
 #
 # To forward an event unchanged: print $0
-#   (same — print appends the required newline)
+#   (bare block strips \n; print re-adds it via ORS)
 #
 # Event format (space-separated, modifiers first):
 #   command b          ⌘B (initial press)
@@ -105,24 +107,23 @@ function run(cmd,    winid, errpipe, runcmd, line) {
 }
 
 # ── Acme built-in keytab ─────────────────────────────────────────────────────
-# Each pattern is an x-expression that matches the exact event line including
-# its trailing newline.  $0 = "command s\n"; printf "!%s" re-emits it with the
-# leading "!" that signals the hotkey was consumed (no extra newline from ORS).
+# Patterns include the trailing \n so cawk's x-expression scanner consumes the
+# full line atomically.  $0 = "command s\n"; printf "!%s" drops it cleanly.
 
-/^command s$/          { run("Put");       print "!" $0; fflush() }
-/^command shift s$/    { run("Putall");    print "!" $0; fflush() }
-/^command shift f$/    { run("Look");      print "!" $0; fflush() }
-/^command w$/          { run("Del");       print "!" $0; fflush() }
-/^command shift w$/    { run("Delcol");    print "!" $0; fflush() }
-/^command n$/          { run("New");       print "!" $0; fflush() }
-/^command shift n$/    { run("Newcol");    print "!" $0; fflush() }
-/^command semicolon$/  { run("Spell");     print "!" $0; fflush() }
-/^command t$/          { run("win");       print "!" $0; fflush() }
-/^command b$/          { run("Ldef");      print "!" $0; fflush() }
-/^command shift b$/    { run("Lrefs");     print "!" $0; fflush() }
-/^escape$/             { run("V");         print "!" $0; fflush() }
-/^command p$/          { run("Search");    print "!" $0; fflush() }
-/^command shift h$/    { run("Highlight"); print "!" $0; fflush() }
+/command s\n/          { run("Put");       printf "!%s", $0 }
+/command shift s\n/    { run("Putall");    printf "!%s", $0 }
+/command shift f\n/    { run("Look");      printf "!%s", $0 }
+/command w\n/          { run("Del");       printf "!%s", $0 }
+/command shift w\n/    { run("Delcol");    printf "!%s", $0 }
+/command n\n/          { run("New");       printf "!%s", $0 }
+/command shift n\n/    { run("Newcol");    printf "!%s", $0 }
+/command semicolon\n/  { run("Spell");     printf "!%s", $0 }
+/command t\n/          { run("win");       printf "!%s", $0 }
+/command b\n/          { run("Ldef");      printf "!%s", $0 }
+/command shift b\n/    { run("Lrefs");     printf "!%s", $0 }
+/escape\n/             { run("V");         printf "!%s", $0 }
+/command p\n/          { run("Search");    printf "!%s", $0 }
+/command shift h\n/    { run("Highlight"); printf "!%s", $0 }
 
 # ── Default: forward all unmatched events back to the application ─────────────
-{ print $0; fflush() }
+{ print $0 }

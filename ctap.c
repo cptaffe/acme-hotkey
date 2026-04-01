@@ -127,11 +127,15 @@ ackNext(int forward)
 	}
 	pthread_mutex_unlock(&gPendMu);
 
-	/* Post or release the keyDown (outside the lock — CGEventPost is safe). */
+	/* Post or release the keyDown (outside the lock — CGEventPost is safe).
+	 * kCGSessionEventTap: re-enters ABOVE the HID layer but BELOW the
+	 * annotated-session layer, so system-shortcut handlers (Dock/Mission
+	 * Control for ctrl+arrow Spaces switching, etc.) still see the event,
+	 * while our own tap passes it through via PASSTHROUGH_MAGIC. */
 	if (forward) {
 		CGEventSetIntegerValueField(e.ref, kCGEventSourceUserData,
 		    PASSTHROUGH_MAGIC);
-		CGEventPost(kCGAnnotatedSessionEventTap, e.ref);
+		CGEventPost(kCGSessionEventTap, e.ref);
 	}
 	CFRelease(e.ref);
 
@@ -140,7 +144,7 @@ ackNext(int forward)
 		if (forward) {
 			CGEventSetIntegerValueField(up, kCGEventSourceUserData,
 			    PASSTHROUGH_MAGIC);
-			CGEventPost(kCGAnnotatedSessionEventTap, up);
+			CGEventPost(kCGSessionEventTap, up);
 		}
 		CFRelease(up);
 	}
