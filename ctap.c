@@ -128,14 +128,15 @@ ackNext(int forward)
 	pthread_mutex_unlock(&gPendMu);
 
 	/* Post or release the keyDown (outside the lock — CGEventPost is safe).
-	 * kCGSessionEventTap: re-enters ABOVE the HID layer but BELOW the
-	 * annotated-session layer, so system-shortcut handlers (Dock/Mission
-	 * Control for ctrl+arrow Spaces switching, etc.) still see the event,
-	 * while our own tap passes it through via PASSTHROUGH_MAGIC. */
+	 * kCGAnnotatedSessionEventTap delivers directly to the target application
+	 * with minimal latency.  Session-level re-posting (kCGSessionEventTap)
+	 * routes through the Dock's synchronous Mission Control tap for every
+	 * event, adding a full keypress of lag.  We handle ctrl+key shortcuts by
+	 * not intercepting them in the first place (see tapCallback below). */
 	if (forward) {
 		CGEventSetIntegerValueField(e.ref, kCGEventSourceUserData,
 		    PASSTHROUGH_MAGIC);
-		CGEventPost(kCGSessionEventTap, e.ref);
+		CGEventPost(kCGAnnotatedSessionEventTap, e.ref);
 	}
 	CFRelease(e.ref);
 
@@ -144,10 +145,35 @@ ackNext(int forward)
 		if (forward) {
 			CGEventSetIntegerValueField(up, kCGEventSourceUserData,
 			    PASSTHROUGH_MAGIC);
-			CGEventPost(kCGSessionEventTap, up);
+			CGEventPost(kCGAnnotatedSessionEventTap, up);
 		}
 		CFRelease(up);
 	}
+}
+
+/*
+ * drainAllPending — discard every entry in gPending without forwarding.
+ *
+ * Called from Go's releaseKeysReader (while keysReaderMu is held) so that
+ * a pipeline restart begins with an empty circular buffer.  Without this,
+ * one stale gPending entry survives each crash-restart cycle, permanently
+ * offsetting the ack queue by one: the N-th ack posts event N-1.
+ */
+void
+drainAllPending(void)
+{
+	pthread_mutex_lock(&gPendMu);
+	while (gHead != gTail) {
+		PendingEntry e = gPending[gTail];
+		gTail = (gTail + 1) % PENDING_CAP;
+		CGEventRef up = pendingKeyUp[e.kc & 0xFF];
+		pendingKeyUp[e.kc & 0xFF] = NULL;
+		pthread_mutex_unlock(&gPendMu);   /* release during CF calls */
+		CFRelease(e.ref);
+		if (up) CFRelease(up);
+		pthread_mutex_lock(&gPendMu);
+	}
+	pthread_mutex_unlock(&gPendMu);
 }
 
 /* ── Modifier check ─────────────────────────────────────────────────────── */

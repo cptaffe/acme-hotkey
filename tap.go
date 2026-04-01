@@ -63,3 +63,8 @@ func setFilter(names []string) {
 }
 
 func startTap() { C.startEventTap() }
+
+// drainPending discards all C-side pending events without forwarding them.
+// Call when the keys reader disconnects so the next pipeline start has a
+// clean circular buffer and no stale-offset artefacts in the ack queue.
+func drainPending() { C.drainAllPending() }
