@@ -278,9 +278,19 @@ startEventTap(void)
 	    CGEventMaskBit(kCGEventKeyUp)   |
 	    CGEventMaskBit(kCGEventFlagsChanged);
 
+	/*
+	 * kCGTailAppendEventTap: we are inserted at the END of the session-level
+	 * tap chain, after all head-insert taps (including the Dock's Mission
+	 * Control tap).  Events that Mission Control consumes (ctrl+arrow for
+	 * Spaces switching, ctrl+number for direct-Space jump, etc.) never reach
+	 * us.  Events that pass through all head-insert taps arrive here; we
+	 * suppress them (return NULL) and re-post at kCGAnnotatedSessionEventTap
+	 * so they are delivered directly to the target application without
+	 * traversing any session-level tap again — giving lag-free delivery.
+	 */
 	gTap = CGEventTapCreate(
 		kCGSessionEventTap,
-		kCGHeadInsertEventTap,
+		kCGTailAppendEventTap,
 		kCGEventTapOptionDefault,
 		mask, tapCallback, NULL);
 
