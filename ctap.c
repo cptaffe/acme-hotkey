@@ -244,6 +244,19 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 		if (isRepeat)
 			return event;
 
+		/*
+		 * Pass ctrl+key combos through unintercepted.  Spaces switching
+		 * (ctrl+arrow, ctrl+number) and other ctrl shortcuts are handled
+		 * by the window server after ALL CGEventTaps have run.  If we
+		 * suppress a ctrl+key event here, it never reaches the window
+		 * server and Spaces switching silently fails.  Passing through
+		 * lets it reach the window server naturally.
+		 *
+		 * kCGEventFlagMaskControl = 0x0000000000040000
+		 */
+		if (flags & kCGEventFlagMaskControl)
+			return event;
+
 		if (!shouldInterceptEvent(event))
 			return event;
 
