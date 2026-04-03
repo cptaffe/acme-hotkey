@@ -36,7 +36,7 @@
 #   ⌘⇧W           command shift w       Delcol
 #   ⌘N            command n             New
 #   ⌘⇧N           command shift n       Newcol
-#   ⌘;            command semicolon     Spell
+#   ⌘;            command ;             Spell
 #   ⌘T            command t             win
 #   ⌘B            command b             Ldef
 #   ⌘⇧B           command shift b       Lrefs
@@ -117,7 +117,7 @@ function run(cmd,    winid, errpipe, runcmd, line) {
 /command shift w\n/    { run("Delcol");    printf "!%s", $0 }
 /command n\n/          { run("New");       printf "!%s", $0 }
 /command shift n\n/    { run("Newcol");    printf "!%s", $0 }
-/command semicolon\n/  { run("Spell");     printf "!%s", $0 }
+/command ;\n/          { run("Spell");     printf "!%s", $0 }
 /command t\n/          { run("win");       printf "!%s", $0 }
 /command b\n/          { run("Ldef");      printf "!%s", $0 }
 /command shift b\n/    { run("Lrefs");     printf "!%s", $0 }

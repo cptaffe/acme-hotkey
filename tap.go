@@ -64,6 +64,17 @@ func setFilter(names []string) {
 
 func startTap() { C.startEventTap() }
 
+// keyCodeName returns the canonical name for a virtual key code as derived
+// from the current keyboard layout by initKeyNames (called at tap startup).
+// Returns "" for unknown or unassigned key codes.
+func keyCodeName(code uint16) string {
+	name := C.virtualKeyName(C.ushort(code))
+	if name == nil {
+		return ""
+	}
+	return C.GoString(name)
+}
+
 // drainPending discards all C-side pending events without forwarding them.
 // Call when the keys reader disconnects so the next pipeline start has a
 // clean circular buffer and no stale-offset artefacts in the ack queue.

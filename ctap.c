@@ -1,8 +1,127 @@
 #include "ctap.h"
+#include <Carbon/Carbon.h>
 #include <libproc.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+
+/* ── Key name table ─────────────────────────────────────────────────────── */
+
+/*
+ * keyNameTable[kc] is the canonical name for virtual key code kc, or NULL.
+ * keyNameStorage holds the UTF-8 bytes for character-producing keys derived
+ * from UCKeyTranslate; semantic keys point directly to string literals.
+ *
+ * Populated once by initKeyNames(), called at the top of startEventTap().
+ */
+#define KEY_NAME_MAX 8
+
+static char        keyNameStorage[256][KEY_NAME_MAX];
+static const char *keyNameTable[256];
+
+void
+initKeyNames(void)
+{
+    /* Semantic keys: named by function, not by the character they print. */
+    static const struct { uint16_t kc; const char *name; } specials[] = {
+        { kVK_Return,           "return"        },
+        { kVK_Tab,              "tab"           },
+        { kVK_Space,            "space"         },
+        { kVK_Delete,           "delete"        },
+        { kVK_Escape,           "escape"        },
+        { kVK_ForwardDelete,    "forwarddelete" },
+        { kVK_Home,             "home"          },
+        { kVK_End,              "end"           },
+        { kVK_PageUp,           "pageup"        },
+        { kVK_PageDown,         "pagedown"      },
+        { kVK_LeftArrow,        "left"          },
+        { kVK_RightArrow,       "right"         },
+        { kVK_DownArrow,        "down"          },
+        { kVK_UpArrow,          "up"            },
+        { kVK_Help,             "help"          },
+        { kVK_F1,               "f1"            },
+        { kVK_F2,               "f2"            },
+        { kVK_F3,               "f3"            },
+        { kVK_F4,               "f4"            },
+        { kVK_F5,               "f5"            },
+        { kVK_F6,               "f6"            },
+        { kVK_F7,               "f7"            },
+        { kVK_F8,               "f8"            },
+        { kVK_F9,               "f9"            },
+        { kVK_F10,              "f10"           },
+        { kVK_F11,              "f11"           },
+        { kVK_F12,              "f12"           },
+        { kVK_F13,              "f13"           },
+        { kVK_F14,              "f14"           },
+        { kVK_F15,              "f15"           },
+        { kVK_F16,              "f16"           },
+        /* Keypad keys that have no printable character equivalent. */
+        { kVK_ANSI_KeypadClear, "clear"         },
+        /* Keypad enter normalises to the same name as regular return. */
+        { kVK_ANSI_KeypadEnter, "return"        },
+    };
+    for (size_t i = 0; i < sizeof specials / sizeof specials[0]; i++) {
+        uint16_t kc = specials[i].kc;
+        if (kc < 256)
+            keyNameTable[kc] = specials[i].name;
+    }
+
+    /*
+     * Character-producing keys (letters, digits, symbols, keypad operators):
+     * ask the current keyboard layout what character each key produces with
+     * no modifiers.  Keypad digits and symbols come out as "0"–"9", "*",
+     * "+", "-", "/", "=" — identical to their non-keypad equivalents.
+     */
+    TISInputSourceRef src = TISCopyCurrentKeyboardInputSource();
+    if (!src)
+        return;
+    CFDataRef layoutData =
+        TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData);
+    CFRelease(src);
+    if (!layoutData)
+        return;
+
+    const UCKeyboardLayout *layout =
+        (const UCKeyboardLayout *)CFDataGetBytePtr(layoutData);
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    UInt32 kbdType = LMGetKbdType();
+#pragma clang diagnostic pop
+
+    for (uint16_t kc = 0; kc < 256; kc++) {
+        if (keyNameTable[kc])
+            continue; /* already assigned a semantic name */
+
+        UInt32      deadKeyState = 0;
+        UniChar     chars[4];
+        UniCharCount actualLen  = 0;
+
+        OSStatus st = UCKeyTranslate(
+            layout, kc, kUCKeyActionDisplay,
+            0, kbdType, kUCKeyTranslateNoDeadKeysBit,
+            &deadKeyState, 4, &actualLen, chars);
+        if (st != noErr || actualLen == 0)
+            continue;
+
+        CFStringRef str =
+            CFStringCreateWithCharacters(kCFAllocatorDefault, chars, actualLen);
+        if (!str)
+            continue;
+        Boolean ok = CFStringGetCString(str, keyNameStorage[kc],
+                                        KEY_NAME_MAX, kCFStringEncodingUTF8);
+        CFRelease(str);
+
+        if (ok && keyNameStorage[kc][0] != '\0')
+            keyNameTable[kc] = keyNameStorage[kc];
+    }
+}
+
+const char *
+virtualKeyName(uint16_t kc)
+{
+    return kc < 256 ? keyNameTable[kc] : NULL;
+}
 
 /* Exported by CGo (//export in tap.go). */
 extern void goKeyDown(unsigned short keyCode, unsigned long long flags);
@@ -283,6 +402,7 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 void
 startEventTap(void)
 {
+	initKeyNames();
 	memset(pendingKeyUp, 0, sizeof pendingKeyUp);
 	gHead = gTail = 0;
 
