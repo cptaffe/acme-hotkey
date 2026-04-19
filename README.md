@@ -2,25 +2,9 @@
 
 A hotkey daemon for [acme](https://9fans.github.io/plan9port/man/man1/acme.html) on macOS.
 
-It sits between the keyboard and Acme at the HID layer (via `CGEventTap`),
-intercepts every keystroke, and exposes them through a **9P file server** as a
-single file called `keys`.  The protocol mirrors Acme's own event file:
-
-- **Reading** `keys` blocks until a keystroke arrives, then returns one line:
-
-  ```
-  control+b
-  command+shift+a
-  a
-  space
-  option+right
-  ```
-
-- **Writing** a key string back to `keys` re-injects the keystroke into the
-  event stream so the focused application (Acme, or any other) receives it as
-  if it were typed normally.
-
-Keystrokes that are neither re-injected nor otherwise consumed are swallowed.
+It sits at the HID layer (via `CGEventTap`), intercepts keystrokes, and
+exposes them through a **9P file server** using Acme's event-file protocol:
+read a `keys` file to receive events; write back to forward or drop them.
 
 ---
 
@@ -28,126 +12,148 @@ Keystrokes that are neither re-injected nor otherwise consumed are swallowed.
 
 | Requirement | Notes |
 |-------------|-------|
-| macOS 12+ | `CGEventTap` at the HID level |
-| [plan9port](https://9fans.github.io/plan9port/) | for `9p`, `9pfuse`, `$NAMESPACE` |
-| Go 1.21+ | CGo is required (Xcode command-line tools) |
+| macOS 12+ | `CGEventTap` / `CGEventPost` |
+| [plan9port](https://9fans.github.io/plan9port/) | `9p`, `9pserve`, `$NAMESPACE` |
+| Go 1.21+ | CGo required (Xcode command-line tools) |
 | Accessibility permission | System Settings → Privacy & Security → Accessibility |
 
 ---
 
-## Building
+## Building & installing
 
 ```sh
-git clone ...
-cd acme-hotkey
-go build -o acme-hotkey .
+make install   # go install + codesign (required for TCC Accessibility identity)
 ```
+
+Running plain `go build` or `go install` resets the code-signing identity and
+macOS revokes the Accessibility permission.  Always use `make install`.
 
 ---
 
 ## Running
 
 ```sh
-./acme-hotkey &
+acme-hotkey &
+# or via 9init:  9p write init/ctl <<<'start acme-hotkey'
 ```
 
-The daemon prints its socket path on startup:
-
-```
-acme-hotkey: listening on /tmp/ns.alice.:0/acme-hotkey
-acme-hotkey: 9p -a unix!/tmp/ns.alice.:0/acme-hotkey read keys
-```
-
-It posts itself to `$NAMESPACE/acme-hotkey`, the same directory Acme and
-other plan9port services use, so tools that speak 9P can find it by name.
+The daemon posts itself to `$NAMESPACE/acme-hotkey` via `9pserve`, so any
+plan9port tool can reach it by name without `-a unix!…` flags.
 
 ---
 
-## Accessing the keys file
+## File system layout
 
-### Direct read (stream keystrokes to stdout)
-
-```sh
-9p -a unix!$NAMESPACE/acme-hotkey read keys
+```
+acme-hotkey/
+├── new           read → "{id}\n"  (creates a session)
+├── frontmost     read → current frontmost process name
+└── {id}/
+    ├── ctl       write "del\n" → remove session subtree
+    ├── keys      OREAD delivers events; OWRITE accepts ack lines
+    └── filter    read/write; newline-separated process name allowlist
 ```
 
-### Mounting with 9pfuse
+### Sessions
+
+Reading `new` allocates a session and returns its numeric ID:
 
 ```sh
-9pfuse unix!$NAMESPACE/acme-hotkey ~/mnt/acme-hotkey
-# now ordinary file access works:
-cat ~/mnt/acme-hotkey/keys
+id=$(9p read acme-hotkey/new)    # e.g. "0"
 ```
 
-Once mounted, the usage from the top of this document works verbatim:
+Each session has its own `keys`, `filter`, and `ctl` files under `$id/`.
+Only one `keys` reader may be active at a time across all sessions.
+
+Remove a session by writing `del` to its `ctl` file:
 
 ```sh
-9p read acme-hotkey/keys       # if mounted at ./acme-hotkey
+echo del | 9p write acme-hotkey/$id/ctl
 ```
 
 ---
 
-## Key string format
+## Event format
+
+Each line delivered by `keys` is space-separated: modifiers first (in
+canonical order), then the key name.
 
 ```
-[modifier+]...[modifier+]keyname
+command b
+command shift s
+escape
+option right
 ```
 
-Modifiers (in canonical order): `control`, `option`, `shift`, `command`
+**Modifier order:** `command`, `shift`, `control`, `option`
 
-Key names match `HIToolbox/Events.h` virtual key codes:
+**Key names** are derived from the current keyboard layout via
+`UCKeyTranslate` — symbols appear as their actual characters:
 
 | Category | Examples |
 |----------|---------|
 | Letters | `a` … `z` |
 | Digits | `0` … `9` |
-| Punctuation | `minus`, `equal`, `leftbracket`, `rightbracket`, `backslash`, `semicolon`, `quote`, `grave`, `comma`, `period`, `slash` |
-| Whitespace / editing | `space`, `tab`, `return`, `delete`, `forwarddelete`, `escape` |
+| Symbols | `; / \ = - [ ] ' `` , .` |
+| Editing | `space`, `tab`, `return`, `delete`, `forwarddelete`, `escape` |
 | Navigation | `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown` |
 | Function | `f1` … `f16` |
-| Keypad | `kp-0` … `kp-9`, `kp-plus`, `kp-minus`, `kp-multiply`, `kp-divide`, `kp-enter`, `kp-period`, `kp-equal`, `kp-clear` |
-
-Examples: `control+b`, `command+shift+a`, `option+right`, `f5`
+| Keypad | same character as non-keypad equivalent (`0`–`9`, `*`, `+`, `-`, `/`, `=`, `.`); `clear`, `return` |
 
 ---
 
-## Writing back (pass-through)
+## Ack protocol
 
-Write the same key string (plus a newline) to re-inject the keystroke:
+`keys` works like Acme's event file.  After the pipeline processes an event,
+write the (possibly modified) line back to forward it to the application, or
+prefix it with `!` to drop it:
 
-```sh
-printf 'control+b\n' | 9p -a unix!$NAMESPACE/acme-hotkey write keys
+```
+command b\n    →  write back "command b\n"  to forward
+                  write back "!command b\n" to consume
 ```
 
-Multiple keys can be written in a single transaction, one per line.
+Events that are neither forwarded nor dropped are swallowed.
 
 ---
 
-## Building a key filter
+## Filtering by process
 
-The typical use case is an intermediary process that reads `keys`, decides
-whether to act on a keystroke or pass it to Acme, and writes it back when
-it should be forwarded:
+Writing newline-separated process names to `filter` restricts interception
+to those processes.  An empty filter (the default) intercepts every process.
 
 ```sh
-#!/bin/sh
-# Example: intercept command+b to bold the selection, forward everything else.
-9p -a unix!$NAMESPACE/acme-hotkey read keys | while IFS= read -r key; do
-    case "$key" in
-    command+b)
-        # handle locally — do not write back
-        my-bold-command
-        ;;
-    *)
-        # forward to Acme
-        printf '%s\n' "$key" | 9p -a unix!$NAMESPACE/acme-hotkey write keys
-        ;;
-    esac
-done
+printf 'Acme\nTerminal\n' | 9p write acme-hotkey/$id/filter
 ```
 
-Multiple readers each get their own independent stream of every keystroke —
-the broker fans out to all subscribers, so a pipeline of filters is possible.
+The filter is applied when the `filter` fid is closed.  It is independent
+of the tap: setting the filter does not require closing or reopening `keys`.
+
+---
+
+## Typical usage (cawk pipeline)
+
+```sh
+id=$(9p read acme-hotkey/new)
+printf 'Acme\n' | 9p write acme-hotkey/$id/filter
+9p read acme-hotkey/$id/keys \
+    | cawk -f ~/src/acme-hotkey/hotkeys.cawk \
+    | 9p write acme-hotkey/$id/keys
+```
+
+`hotkeys.cawk` matches event lines and either handles the hotkey locally
+(printing `!event\n` to drop the keystroke) or forwards it unchanged.
+
+---
+
+## frontmost
+
+Reading `frontmost` returns the process name of the frontmost application
+at the moment of the read.  This is a snapshot — it does not block or update.
+
+```sh
+9p read acme-hotkey/frontmost   # e.g. "Acme\n"
+```
 
 ---
 
@@ -157,44 +163,41 @@ the broker fans out to all subscribers, so a pipeline of filters is possible.
 Physical key press
       │
       ▼
-CGEventTap  (kCGHIDEventTap — lowest macOS level)
-      │  swallows event; calls goKeyEvent()
+CGEventTap  (kCGTailAppendEventTap on kCGSessionEventTap)
+      │  filters by process (filter file) and listener count
+      │  swallows event; CFRetains it into gPending circular buffer
+      │  calls goKeyDown() → publishes to Go eventStream channel
       ▼
-keyEventChan  (Go buffered channel, 256 events)
+9P Read on keys  (blocks in select{} until event or Tflush)
+      │  returns "modifiers keyname\n"
+      ▼
+cawk pipeline  (pattern-matches, runs acme commands, passes through)
       │
       ▼
-KeyBroker.publish()
-      │  fans out to every open keys-fid subscription channel
-      ▼
-9P Tread goroutine  (one per blocking read; cancelled by Tflush)
-      │  sends  "keyname\n"  as Rread data
-      ▼
-9p / cat / custom reader
-
-               ── write path ──
-
-Client writes "keyname\n" to keys fid
+9P Write on keys  ("!line\n" → drop  /  "line\n" → forward)
       │
       ▼
-doWrite() → parseKeyEvent() → reInjectKey()
-      │
-      ▼
-CGEventPost(kCGAnnotatedSessionEventTap, …)
-      │  posted above the HID tap, so our tap never sees it
-      ▼
-Focused application (Acme, Terminal, …)
+ackNext()  →  CGEventPost(kCGAnnotatedSessionEventTap, event)
+                 delivered directly to target app, bypassing our tap
 ```
 
-### Why `kCGAnnotatedSessionEventTap` for re-injection?
+### Key design choices
 
-Events posted at `kCGAnnotatedSessionEventTap` enter the event pipeline
-*after* the HID-level tap, so our own tap never re-intercepts them.  This
-avoids infinite loops without needing a sentinel marker in the event.
+**`kCGTailAppendEventTap`** — inserted at the end of the session-level tap
+chain, after Mission Control's head-insert tap.  Ctrl+arrow (Spaces) and
+other ctrl shortcuts are consumed by Mission Control before we see them;
+we additionally pass ctrl+key combos through unconditionally.
 
-### Tflush handling
+**`kCGAnnotatedSessionEventTap` for re-injection** — avoids re-entering
+the session-level tap chain (no lag, no infinite loop).
 
-9P clients (e.g. `9p read` interrupted with ^C) send `Tflush` to cancel an
-outstanding `Tread`.  Each blocking read goroutine holds a `context.Context`;
-`doFlush` calls the matching `cancel()`, the goroutine exits without sending
-`Rread`, and `Rflush` is sent before the goroutine finishes — satisfying the
-9P ordering requirement.
+**Circular buffer (gPending)** — the CGEventRef is retained in C until the
+write-back ack arrives.  Go only carries the string representation.
+
+**Tflush handling** — each blocking `Read` runs with a `context.Context`
+derived from the 9P request.  When a Tflush arrives, `srv9p` cancels the
+context; the `select` exits, and the in-flight CGEvent is dropped via
+`ackNext(false)` to keep the buffer in sync.
+
+**Single keys reader** — enforced by a global mutex with a 500 ms polling
+window to tolerate rapid pipeline restarts (9init crash-restart race).

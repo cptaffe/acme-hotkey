@@ -11,20 +11,18 @@ import (
 )
 
 func main() {
-	l, cleanup, err := p9srv.ListenUnix("acme-hotkey")
+	rw, cleanup, err := p9srv.Post("acme-hotkey")
 	if err != nil {
-		log.Fatalf("listen: %v", err)
+		log.Fatalf("post: %v", err)
 	}
 	defer cleanup()
 
-	srvPath := p9srv.ServicePath("acme-hotkey")
-	fmt.Fprintln(os.Stderr, "acme-hotkey: listening on", srvPath)
-	fmt.Fprintf(os.Stderr, "acme-hotkey: 9p -a unix!%s read keys\n", srvPath)
+	fmt.Fprintln(os.Stderr, "acme-hotkey: posted as acme-hotkey")
 
-	// Start the CGEventTap run loop (blocks until process exits).
+	// Start the CGEventTap run loop in the background.
 	go startTap()
 
-	// Clean up socket on signal.
+	// Release the post on SIGINT/SIGTERM.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -33,13 +31,6 @@ func main() {
 		os.Exit(0)
 	}()
 
-	srv := newServer()
-	for {
-		c, err := l.Accept()
-		if err != nil {
-			log.Printf("accept: %v", err)
-			continue
-		}
-		go srv.handleConn(c)
-	}
+	srv := buildServer()
+	srv.Serve(rw, rw)
 }
