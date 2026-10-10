@@ -3,6 +3,7 @@
 #include <libproc.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ── Key name table ─────────────────────────────────────────────────────── */
@@ -295,6 +296,113 @@ drainAllPending(void)
 	pthread_mutex_unlock(&gPendMu);
 }
 
+/* ── System shortcuts ──────────────────────────────────────────────────── */
+
+/*
+ * The window server handles system shortcuts (Spotlight, screenshots) only
+ * for keystrokes that leave the tap chain normally.  An event we suppress and
+ * re-post at kCGAnnotatedSessionEventTap goes straight to the application and
+ * never reaches it, so ⌘Space and ⌘⇧4 silently stop working while Acme is
+ * frontmost.  Pass through every keystroke that matches an enabled system
+ * shortcut.
+ *
+ * The table starts from the macOS defaults, which com.apple.symbolichotkeys
+ * omits until the user changes them, and is overridden by that domain's
+ * AppleSymbolicHotKeys entries.  It is read once, by startEventTap().
+ */
+#define MOD_MASK (kCGEventFlagMaskCommand | kCGEventFlagMaskShift | \
+                  kCGEventFlagMaskControl | kCGEventFlagMaskAlternate)
+#define MAX_SYSKEYS 256
+
+typedef struct { int id; CGKeyCode kc; unsigned long long mods; int on; } SysKey;
+
+static SysKey sysKeys[MAX_SYSKEYS] = {
+	{  28, kVK_ANSI_3, kCGEventFlagMaskCommand | kCGEventFlagMaskShift, 1 },
+	{  29, kVK_ANSI_3, kCGEventFlagMaskCommand | kCGEventFlagMaskShift |
+	                   kCGEventFlagMaskControl, 1 },
+	{  30, kVK_ANSI_4, kCGEventFlagMaskCommand | kCGEventFlagMaskShift, 1 },
+	{  31, kVK_ANSI_4, kCGEventFlagMaskCommand | kCGEventFlagMaskShift |
+	                   kCGEventFlagMaskControl, 1 },
+	{  64, kVK_Space,  kCGEventFlagMaskCommand, 1 },
+	{  65, kVK_Space,  kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate, 1 },
+	{ 184, kVK_ANSI_5, kCGEventFlagMaskCommand | kCGEventFlagMaskShift, 1 },
+};
+static int nSysKeys = 7;
+
+static int
+cfInt(CFTypeRef v, long long *out)
+{
+	return v && CFGetTypeID(v) == CFNumberGetTypeID() &&
+	    CFNumberGetValue((CFNumberRef)v, kCFNumberLongLongType, out);
+}
+
+static void
+loadSysKey(const void *key, const void *value, void *ctx)
+{
+	(void)ctx;
+	char buf[16];
+	if (CFGetTypeID(key) != CFStringGetTypeID() ||
+	    !CFStringGetCString((CFStringRef)key, buf, sizeof buf, kCFStringEncodingUTF8) ||
+	    CFGetTypeID(value) != CFDictionaryGetTypeID())
+		return;
+	int id = atoi(buf);
+	CFDictionaryRef d = (CFDictionaryRef)value;
+
+	CFTypeRef en = CFDictionaryGetValue(d, CFSTR("enabled"));
+	int on = en && CFGetTypeID(en) == CFBooleanGetTypeID() &&
+	    CFBooleanGetValue((CFBooleanRef)en);
+
+	long long kc = -1, mods = 0;
+	CFTypeRef v = CFDictionaryGetValue(d, CFSTR("value"));
+	if (v && CFGetTypeID(v) == CFDictionaryGetTypeID()) {
+		CFTypeRef p = CFDictionaryGetValue((CFDictionaryRef)v, CFSTR("parameters"));
+		if (p && CFGetTypeID(p) == CFArrayGetTypeID() &&
+		    CFArrayGetCount((CFArrayRef)p) >= 3) {
+			cfInt(CFArrayGetValueAtIndex((CFArrayRef)p, 1), &kc);
+			cfInt(CFArrayGetValueAtIndex((CFArrayRef)p, 2), &mods);
+		}
+	}
+
+	SysKey *k = NULL;
+	for (int i = 0; i < nSysKeys; i++)
+		if (sysKeys[i].id == id) { k = &sysKeys[i]; break; }
+	if (!k) {
+		if (nSysKeys == MAX_SYSKEYS)
+			return;
+		k = &sysKeys[nSysKeys++];
+		*k = (SysKey){ id, 0, 0, 0 };
+	}
+	k->on = on;
+	if (kc >= 0 && kc != 0xFFFF) {
+		k->kc = (CGKeyCode)kc;
+		k->mods = (unsigned long long)mods & MOD_MASK;
+	} else if (k->mods == 0) {
+		k->on = 0;	/* enabled but unbound: nothing to match */
+	}
+}
+
+static void
+loadSysKeys(void)
+{
+	CFPropertyListRef hk = CFPreferencesCopyAppValue(
+	    CFSTR("AppleSymbolicHotKeys"), CFSTR("com.apple.symbolichotkeys"));
+	if (!hk)
+		return;
+	if (CFGetTypeID(hk) == CFDictionaryGetTypeID())
+		CFDictionaryApplyFunction((CFDictionaryRef)hk, loadSysKey, NULL);
+	CFRelease(hk);
+}
+
+static int
+isSysKey(CGKeyCode kc, unsigned long long flags)
+{
+	flags &= MOD_MASK;
+	for (int i = 0; i < nSysKeys; i++)
+		if (sysKeys[i].on && sysKeys[i].kc == kc && sysKeys[i].mods == flags)
+			return 1;
+	return 0;
+}
+
 /* ── Modifier check ─────────────────────────────────────────────────────── */
 
 static int
@@ -376,6 +484,9 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 		if (flags & kCGEventFlagMaskControl)
 			return event;
 
+		if (isSysKey(kc, flags))
+			return event;
+
 		if (!shouldInterceptEvent(event))
 			return event;
 
@@ -403,6 +514,7 @@ void
 startEventTap(void)
 {
 	initKeyNames();
+	loadSysKeys();
 	memset(pendingKeyUp, 0, sizeof pendingKeyUp);
 	gHead = gTail = 0;
 
