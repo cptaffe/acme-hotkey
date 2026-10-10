@@ -9,6 +9,8 @@ const char *frontmostProcName(void);
 
 void clearFilter(void);
 void addFilterProc(const char *name);
+void clearGrabs(void);
+void addGrab(unsigned short kc, unsigned long long mods);
 void setListenerCount(int n);
 void drainAllPending(void); /* drop all C-side pending events; call on reader disconnect */
 

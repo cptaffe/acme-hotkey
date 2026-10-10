@@ -11,6 +11,7 @@ import (
 )
 
 func main() {
+	initKeys()
 	rw, cleanup, err := p9srv.Post("acme-hotkey")
 	if err != nil {
 		log.Fatalf("post: %v", err)
@@ -31,6 +32,5 @@ func main() {
 		os.Exit(0)
 	}()
 
-	srv := buildServer()
-	srv.Serve(rw, rw)
+	buildServer().Serve(rw, rw)
 }

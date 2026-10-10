@@ -51,7 +51,8 @@ acme-hotkey/
 └── {id}/
     ├── ctl       write "del\n" → remove session subtree
     ├── keys      OREAD delivers events; OWRITE accepts ack lines
-    └── filter    read/write; newline-separated process name allowlist
+    ├── filter    read/write; newline-separated process name allowlist
+    └── grab      read/write; newline-separated keystrokes to intercept
 ```
 
 ### Sessions
@@ -128,6 +129,21 @@ printf 'Acme\nTerminal\n' | 9p write acme-hotkey/$id/filter
 
 The filter is applied when the `filter` fid is closed.  It is independent
 of the tap: setting the filter does not require closing or reopening `keys`.
+
+## Grabbing keystrokes
+
+Writing keystrokes to `grab`, one per line in the event format, restricts
+interception to those keystrokes.  Every other keystroke passes through
+untouched, so the system still sees it: Space after ⌘⇧4 selects a window,
+and typing never waits on the pipeline.  An empty grab list (the default)
+intercepts every keystroke.
+
+```sh
+printf 'command s\ncommand b\nescape\n' | 9p write acme-hotkey/$id/grab
+```
+
+The 9init service derives the list from the patterns in `hotkeys.straw`.
+Like the filter, it is applied when the `grab` fid is closed.
 
 ---
 

@@ -22,16 +22,44 @@ import (
 //   {id}/
 //   ├── ctl     write "del\n" → remove session subtree
 //   ├── keys    OREAD activates tap; Clunk deactivates; OWRITE accepts acks
-//   └── filter  read/write; current filter applied immediately on clunk
+//   ├── filter  read/write; current filter applied immediately on clunk
+//   └── grab    read/write; keystrokes to intercept, applied on clunk
 
 type session struct {
 	id  int
 	dir *srv9p.File
 	// child files — retained for removal when "del" is written to ctl
-	keys, filter, ctl *srv9p.File
+	keys, filter, grab, ctl *srv9p.File
 
 	mu          sync.Mutex
 	filterNames []string // current set; protected by mu
+	grabLines   []string // bound keystrokes; protected by mu
+}
+
+// grabClone returns a copy of the bound keystrokes.
+func (s *session) grabClone() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.grabLines...)
+}
+
+// grabSnapshot returns the bound keystrokes, one per line, for reads.
+func (s *session) grabSnapshot() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.grabLines) == 0 {
+		return ""
+	}
+	return strings.Join(s.grabLines, "\n") + "\n"
+}
+
+// applyGrab parses raw write data, stores the lines, and calls setGrabs.
+func (s *session) applyGrab(data []byte) {
+	lines := parseNames(data)
+	s.mu.Lock()
+	s.grabLines = lines
+	s.mu.Unlock()
+	setGrabs(lines)
 }
 
 // filterClone returns a copy of the current filter slice, safe to pass to C.
@@ -69,7 +97,7 @@ func (s *session) applyFilter(data []byte) {
 // Existing open fids are unaffected (9P semantics); they will naturally
 // call Clunk when the client clunks them.
 func (s *session) del() error {
-	for _, f := range []*srv9p.File{s.keys, s.filter, s.ctl} {
+	for _, f := range []*srv9p.File{s.keys, s.filter, s.grab, s.ctl} {
 		if err := f.Remove(); err != nil {
 			return err
 		}
@@ -85,6 +113,7 @@ const (
 	kindKeys   fileKind = iota
 	kindFilter          // nolint:deadcode
 	kindCtl             // nolint:deadcode
+	kindGrab
 )
 
 // sessionFile is attached to every file inside a session directory.
@@ -184,6 +213,7 @@ func newSession(tree *srv9p.Tree, uid string) *session {
 	dir, _ := tree.Root.Create(fmt.Sprintf("%d", id), uid, plan9.DMDIR|0555, nil)
 	keys, _ := dir.Create("keys", uid, 0666, &sessionFile{kindKeys, s})
 	filter, _ := dir.Create("filter", uid, 0666, &sessionFile{kindFilter, s})
+	grab, _ := dir.Create("grab", uid, 0666, &sessionFile{kindGrab, s})
 	ctl, _ := dir.Create("ctl", uid, 0222, &sessionFile{kindCtl, s})
 
 	// Store session pointer in dir.Aux for future reference (e.g., via Walk).
@@ -192,6 +222,7 @@ func newSession(tree *srv9p.Tree, uid string) *session {
 	s.dir = dir
 	s.keys = keys
 	s.filter = filter
+	s.grab = grab
 	s.ctl = ctl
 	return s
 }
@@ -238,14 +269,19 @@ func buildServer() *srv9p.Server {
 						// Apply this session's filter so the tap captures
 						// the right processes from the very first event.
 						setFilter(sf.sess.filterClone())
+						setGrabs(sf.sess.grabClone())
 					} else {
 						fid.SetAux(&openedKeys{isReader: false})
 					}
 
-				case kindFilter:
+				case kindFilter, kindGrab:
 					of := &openedFilter{}
 					if m == plan9.OREAD || m == plan9.ORDWR {
-						of.snapshot = sf.sess.filterSnapshot()
+						if sf.kind == kindGrab {
+							of.snapshot = sf.sess.grabSnapshot()
+						} else {
+							of.snapshot = sf.sess.filterSnapshot()
+						}
 					}
 					fid.SetAux(of)
 
@@ -324,7 +360,7 @@ func buildServer() *srv9p.Server {
 					}
 				}
 
-			case kindFilter:
+			case kindFilter, kindGrab:
 				// Accumulate writes by offset (like an io.WriterAt).
 				of, ok := fid.Aux().(*openedFilter)
 				if !ok {
@@ -381,7 +417,11 @@ func buildServer() *srv9p.Server {
 				// the next keys Open.
 				if len(aux.wbuf) > 0 {
 					if sf, ok := fid.File().Aux.(*sessionFile); ok {
-						sf.sess.applyFilter(aux.wbuf)
+						if sf.kind == kindGrab {
+							sf.sess.applyGrab(aux.wbuf)
+						} else {
+							sf.sess.applyFilter(aux.wbuf)
+						}
 					}
 				}
 			}

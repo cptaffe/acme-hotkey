@@ -13,7 +13,7 @@
  * keyNameStorage holds the UTF-8 bytes for character-producing keys derived
  * from UCKeyTranslate; semantic keys point directly to string literals.
  *
- * Populated once by initKeyNames(), called at the top of startEventTap().
+ * Populated once by initKeyNames(), called before the service is posted.
  */
 #define KEY_NAME_MAX 8
 
@@ -74,13 +74,17 @@ initKeyNames(void)
      * "+", "-", "/", "=" — identical to their non-keypad equivalents.
      */
     TISInputSourceRef src = TISCopyCurrentKeyboardInputSource();
-    if (!src)
+    if (!src) {
+        fprintf(stderr, "acme-hotkey: no keyboard input source\n");
         return;
+    }
     CFDataRef layoutData =
         TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData);
     CFRelease(src);
-    if (!layoutData)
+    if (!layoutData) {
+        fprintf(stderr, "acme-hotkey: keyboard input source has no layout\n");
         return;
+    }
 
     const UCKeyboardLayout *layout =
         (const UCKeyboardLayout *)CFDataGetBytePtr(layoutData);
@@ -403,6 +407,52 @@ isSysKey(CGKeyCode kc, unsigned long long flags)
 	return 0;
 }
 
+/* ── Grabs ───────────────────────────────────────────────────────────────── */
+
+/*
+ * The keystrokes the pipeline has bound.  Any other keystroke passes
+ * through untouched, so whatever the system does with it (screenshot
+ * selection, Spotlight, input methods) happens normally.  With no grabs
+ * set, every keystroke is intercepted, as before grabs existed.
+ */
+#define MAX_GRAB 128
+
+typedef struct { CGKeyCode kc; unsigned long long mods; } Grab;
+
+static Grab grabs[MAX_GRAB];
+static int  nGrab = 0;
+
+void
+clearGrabs(void)
+{
+	pthread_mutex_lock(&filterMu);
+	nGrab = 0;
+	pthread_mutex_unlock(&filterMu);
+}
+
+void
+addGrab(unsigned short kc, unsigned long long mods)
+{
+	pthread_mutex_lock(&filterMu);
+	if (nGrab < MAX_GRAB)
+		grabs[nGrab++] = (Grab){ kc, mods & MOD_MASK };
+	pthread_mutex_unlock(&filterMu);
+}
+
+static int
+isGrabbed(CGKeyCode kc, unsigned long long flags)
+{
+	int ok;
+
+	flags &= MOD_MASK;
+	pthread_mutex_lock(&filterMu);
+	ok = nGrab == 0;
+	for (int i = 0; i < nGrab && !ok; i++)
+		ok = grabs[i].kc == kc && grabs[i].mods == flags;
+	pthread_mutex_unlock(&filterMu);
+	return ok;
+}
+
 /* ── Modifier check ─────────────────────────────────────────────────────── */
 
 static int
@@ -487,6 +537,9 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 		if (isSysKey(kc, flags))
 			return event;
 
+		if (!isGrabbed(kc, flags))
+			return event;
+
 		if (!shouldInterceptEvent(event))
 			return event;
 
@@ -513,7 +566,6 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 void
 startEventTap(void)
 {
-	initKeyNames();
 	loadSysKeys();
 	memset(pendingKeyUp, 0, sizeof pendingKeyUp);
 	gHead = gTail = 0;
