@@ -131,17 +131,17 @@ of the tap: setting the filter does not require closing or reopening `keys`.
 
 ---
 
-## Typical usage (cawk pipeline)
+## Typical usage (straw pipeline)
 
 ```sh
 id=$(9p read acme-hotkey/new)
 printf 'Acme\n' | 9p write acme-hotkey/$id/filter
 9p read acme-hotkey/$id/keys \
-    | cawk -f ~/src/acme-hotkey/hotkeys.cawk \
+    | straw -f ~/src/acme-hotkey/hotkeys.straw \
     | 9p write acme-hotkey/$id/keys
 ```
 
-`hotkeys.cawk` matches event lines and either handles the hotkey locally
+`hotkeys.straw` matches event lines and either handles the hotkey locally
 (printing `!event\n` to drop the keystroke) or forwards it unchanged.
 
 ---
@@ -171,7 +171,7 @@ CGEventTap  (kCGTailAppendEventTap on kCGSessionEventTap)
 9P Read on keys  (blocks in select{} until event or Tflush)
       │  returns "modifiers keyname\n"
       ▼
-cawk pipeline  (pattern-matches, runs acme commands, passes through)
+straw pipeline  (pattern-matches, runs acme commands, passes through)
       │
       ▼
 9P Write on keys  ("!line\n" → drop  /  "line\n" → forward)

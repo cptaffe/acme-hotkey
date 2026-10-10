@@ -1,8 +1,8 @@
-# hotkeys.cawk — dispatch acme hotkeys from the acme-hotkey keys stream.
+# hotkeys.straw — dispatch acme hotkeys from the acme-hotkey keys stream.
 #
 # Run via 9init (acme-hotkeys) or manually:
 #
-#   9p read acme-hotkey/keys | cawk -f hotkeys.cawk | 9p write acme-hotkey/keys
+#   9p read acme-hotkey/keys | straw -f hotkeys.straw | 9p write acme-hotkey/keys
 #
 # The keys file works like Acme's event file: reading delivers one event per
 # line; writing back acknowledges it.  Write-backs decide the event's fate:
@@ -11,13 +11,13 @@
 #   printf "!%s", $0  → drop:    original event consumed (hotkey handled here)
 #
 # Execution model:
-#   cawk uses x-expression semantics for top-level patterns.  Each /re\n/
+#   straw uses x-expression semantics for top-level patterns.  Each /re\n/
 #   matches the event line including its trailing newline; $0 includes the \n.
 #   The implicit bare block { } sees $0 WITHOUT the trailing newline (AWK compat).
 #
 # To drop a matched event: printf "!%s", $0
 #   ($0 already contains \n; printf avoids the double-newline that print+ORS adds)
-#   cawk line-buffers stdout, so no fflush() is needed.
+#   straw line-buffers stdout, so no fflush() is needed.
 #
 # To forward an event unchanged: print $0
 #   (bare block strips \n; print re-adds it via ORS)
@@ -107,7 +107,7 @@ function run(cmd,    winid, errpipe, runcmd, line) {
 }
 
 # ── Acme built-in keytab ─────────────────────────────────────────────────────
-# Patterns include the trailing \n so cawk's x-expression scanner consumes the
+# Patterns include the trailing \n so straw's x-expression scanner consumes the
 # full line atomically.  $0 = "command s\n"; printf "!%s" drops it cleanly.
 
 /command s\n/          { run("Put");       printf "!%s", $0 }
