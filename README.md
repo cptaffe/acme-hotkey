@@ -1,10 +1,13 @@
 # acme-hotkey
 
-A hotkey daemon for [acme](https://9fans.github.io/plan9port/man/man1/acme.html) on macOS.
+Keyboard shortcuts for [acme](https://9fans.github.io/plan9port/man/man1/acme.html)
+on macOS, built the way the
+[plumber](https://9fans.github.io/plan9port/man/man4/plumber.html) is.
 
-It sits at the HID layer (via `CGEventTap`), intercepts keystrokes, and
-exposes them through a **9P file server** using Acme's event-file protocol:
-read a `keys` file to receive events; write back to forward or drop them.
+A `CGEventTap` hands each keystroke to the daemon, which matches it against a
+rules file while the tap waits.  A key no rule wants is left alone, so the
+system and the application see it as if acme-hotkey were not there.  A key a
+rule wants is consumed, and the rule's rc script runs.
 
 ---
 
@@ -12,14 +15,14 @@ read a `keys` file to receive events; write back to forward or drop them.
 
 | Requirement | Notes |
 |-------------|-------|
-| macOS 12+ | `CGEventTap` / `CGEventPost` |
+| macOS 12+ | `CGEventTap` |
 | [plan9port](https://9fans.github.io/plan9port/) | `9p`, `9pserve`, `$NAMESPACE` |
-| Go 1.21+ | CGo required (Xcode command-line tools) |
+| Go 1.24+ | cgo (Xcode command-line tools) |
 | Accessibility permission | System Settings → Privacy & Security → Accessibility |
 
 ---
 
-## Building & installing
+## Building and installing
 
 ```sh
 make install   # go install + codesign (required for TCC Accessibility identity)
@@ -33,187 +36,85 @@ macOS revokes the Accessibility permission.  Always use `make install`.
 ## Running
 
 ```sh
-acme-hotkey &
-# or via 9init:  9p write init/ctl <<<'start acme-hotkey'
+acme-hotkey [-rules file]   # default ~/lib/hotkeys
 ```
 
-The daemon posts itself to `$NAMESPACE/acme-hotkey` via `9pserve`, so any
-plan9port tool can reach it by name without `-a unix!…` flags.
+The daemon posts itself to `$NAMESPACE/acme-hotkey`.
 
 ---
 
-## File system layout
+## Rules
+
+Rules are written in the hotkey dialect of
+[seq](https://github.com/cptaffe/automaton), and run as rc scripts:
+
+```
+# Edit ,>9p write acme-hotkey/rules
+%{
+fn ctl { echo $1 | 9p write acme/`{9p read acme-focused/focus}/ctl }
+%}
+%delay settle 1s
+
+acme: when app == "devdraw"
+	%settles settle
+	command-s		{ ctl put }	# save
+	control-x control-s	{ ctl put }
+	command-m		-> mode
+
+mode:
+	escape			{ ctl show } -> acme
+```
+
+- **Scopes.** A line `name:` starts a scope, optionally with `when` and an
+  expression over `app`, the process the key is headed for: `==`, `!=`,
+  `~` (a regular expression), `&&`, `||`, `!`, and parentheses.
+- **Rules.** Keys, an rc block in braces, and optionally `-> scope`, which
+  makes that scope the mode until another rule leaves it.  A key is the
+  name the layout gives it after any of `command-`, `shift-`, `control-`,
+  and `option-`, in any order.  Several keys make a sequence.  A comment
+  after a rule is its label.  Blocks may span lines and nest.
+- **The prelude** between `%{` and `%}` is prepended to every block.  Each
+  block runs in its own rc with `$app` and `$key` set.
+- **Delays** are named: `%delay name duration`.  `%settles name` in a scope
+  lets a rule that is also the start of a longer one wait that long for the
+  next key; without it the pair is an error, as are two rules on the same
+  keys.
+- **Order.** With no mode, the first scope whose `when` holds and which
+  binds the key takes it.
+- **System shortcuts** (Spotlight, screenshots, and any other enabled
+  symbolic hotkey) always pass through.
+
+## File system
 
 ```
 acme-hotkey/
-├── new           read → "{id}\n"  (creates a session)
-├── frontmost     read → current frontmost process name
-└── {id}/
-    ├── ctl       write "del\n" → remove session subtree
-    ├── keys      OREAD delivers events; OWRITE accepts ack lines
-    ├── filter    read/write; newline-separated process name allowlist
-    └── grab      read/write; newline-separated keystrokes to intercept
+├── rules   read: the rules; write: replace them
+├── card    read: every binding, one per line: scope, keys, action, label
+└── send    write: "app key" lines, matched as if the key were pressed
 ```
 
-### Sessions
-
-Reading `new` allocates a session and returns its numeric ID:
+As with `plumb/rules`, a write to `rules` is checked as it arrives, so an
+error comes back on the write with its line number, and nothing is
+installed.  The rules are replaced when the file is closed:
 
 ```sh
-id=$(9p read acme-hotkey/new)    # e.g. "0"
+9p write acme-hotkey/rules <$home/lib/hotkeys
 ```
-
-Each session has its own `keys`, `filter`, and `ctl` files under `$id/`.
-Only one `keys` reader may be active at a time across all sessions.
-
-Remove a session by writing `del` to its `ctl` file:
 
 ```sh
-echo del | 9p write acme-hotkey/$id/ctl
-```
-
----
-
-## Event format
-
-Each line delivered by `keys` is space-separated: modifiers first (in
-canonical order), then the key name.
-
-```
-command b
-command shift s
-escape
-option right
-```
-
-**Modifier order:** `command`, `shift`, `control`, `option`
-
-**Key names** are derived from the current keyboard layout via
-`UCKeyTranslate` — symbols appear as their actual characters:
-
-| Category | Examples |
-|----------|---------|
-| Letters | `a` … `z` |
-| Digits | `0` … `9` |
-| Symbols | `; / \ = - [ ] ' `` , .` |
-| Editing | `space`, `tab`, `return`, `delete`, `forwarddelete`, `escape` |
-| Navigation | `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown` |
-| Function | `f1` … `f16` |
-| Keypad | same character as non-keypad equivalent (`0`–`9`, `*`, `+`, `-`, `/`, `=`, `.`); `clear`, `return` |
-
----
-
-## Ack protocol
-
-`keys` works like Acme's event file.  After the pipeline processes an event,
-write the (possibly modified) line back to forward it to the application, or
-prefix it with `!` to drop it:
-
-```
-command b\n    →  write back "command b\n"  to forward
-                  write back "!command b\n" to consume
-```
-
-Events that are neither forwarded nor dropped are swallowed.
-
----
-
-## Filtering by process
-
-Writing newline-separated process names to `filter` restricts interception
-to those processes.  An empty filter (the default) intercepts every process.
-
-```sh
-printf 'Acme\nTerminal\n' | 9p write acme-hotkey/$id/filter
-```
-
-The filter is applied when the `filter` fid is closed.  It is independent
-of the tap: setting the filter does not require closing or reopening `keys`.
-
-## Grabbing keystrokes
-
-Writing keystrokes to `grab`, one per line in the event format, restricts
-interception to those keystrokes.  Every other keystroke passes through
-untouched, so the system still sees it: Space after ⌘⇧4 selects a window,
-and typing never waits on the pipeline.  An empty grab list (the default)
-intercepts every keystroke.
-
-```sh
-printf 'command s\ncommand b\nescape\n' | 9p write acme-hotkey/$id/grab
-```
-
-The 9init service derives the list from the patterns in `hotkeys.straw`.
-Like the filter, it is applied when the `grab` fid is closed.
-
----
-
-## Typical usage (straw pipeline)
-
-```sh
-id=$(9p read acme-hotkey/new)
-printf 'Acme\n' | 9p write acme-hotkey/$id/filter
-9p read acme-hotkey/$id/keys \
-    | straw -f ~/src/acme-hotkey/hotkeys.straw \
-    | 9p write acme-hotkey/$id/keys
-```
-
-`hotkeys.straw` matches event lines and either handles the hotkey locally
-(printing `!event\n` to drop the keystroke) or forwards it unchanged.
-
----
-
-## frontmost
-
-Reading `frontmost` returns the process name of the frontmost application
-at the moment of the read.  This is a snapshot — it does not block or update.
-
-```sh
-9p read acme-hotkey/frontmost   # e.g. "Acme\n"
+echo 'devdraw command-s' | 9p write acme-hotkey/send
 ```
 
 ---
 
 ## How it works
 
-```
-Physical key press
-      │
-      ▼
-CGEventTap  (kCGTailAppendEventTap on kCGSessionEventTap)
-      │  filters by process (filter file) and listener count
-      │  swallows event; CFRetains it into gPending circular buffer
-      │  calls goKeyDown() → publishes to Go eventStream channel
-      ▼
-9P Read on keys  (blocks in select{} until event or Tflush)
-      │  returns "modifiers keyname\n"
-      ▼
-straw pipeline  (pattern-matches, runs acme commands, passes through)
-      │
-      ▼
-9P Write on keys  ("!line\n" → drop  /  "line\n" → forward)
-      │
-      ▼
-ackNext()  →  CGEventPost(kCGAnnotatedSessionEventTap, event)
-                 delivered directly to target app, bypassing our tap
-```
-
-### Key design choices
-
-**`kCGTailAppendEventTap`** — inserted at the end of the session-level tap
-chain, after Mission Control's head-insert tap.  Ctrl+arrow (Spaces) and
-other ctrl shortcuts are consumed by Mission Control before we see them;
-we additionally pass ctrl+key combos through unconditionally.
-
-**`kCGAnnotatedSessionEventTap` for re-injection** — avoids re-entering
-the session-level tap chain (no lag, no infinite loop).
-
-**Circular buffer (gPending)** — the CGEventRef is retained in C until the
-write-back ack arrives.  Go only carries the string representation.
-
-**Tflush handling** — each blocking `Read` runs with a `context.Context`
-derived from the 9P request.  When a Tflush arrives, `srv9p` cancels the
-context; the `select` exits, and the in-flight CGEvent is dropped via
-`ackNext(false)` to keep the buffer in sync.
-
-**Single keys reader** — enforced by a global mutex with a 500 ms polling
-window to tolerate rapid pipeline restarts (9init crash-restart race).
+- The tap is appended to the end of the session tap chain, so shortcuts the
+  Dock's Mission Control tap consumes never reach it.
+- For each key-down that is not a modifier, an auto-repeat or a system
+  shortcut, the tap calls into Go with the key and the target process.  Go
+  steps the compiled rules and answers consume or pass before the callback
+  returns.  A consumed key's auto-repeats and key-up are consumed too.
+- The rules compile to one table with seq.  A sequence in progress waits on
+  the delays its state names; the daemon runs a timer for each.
+- Nothing is held or re-posted: a passed key is the original event.

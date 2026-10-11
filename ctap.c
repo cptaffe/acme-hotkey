@@ -1,7 +1,6 @@
 #include "ctap.h"
 #include <Carbon/Carbon.h>
 #include <libproc.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -128,177 +127,10 @@ virtualKeyName(uint16_t kc)
     return kc < 256 ? keyNameTable[kc] : NULL;
 }
 
-/* Exported by CGo (//export in tap.go). */
-extern void goKeyDown(unsigned short keyCode, unsigned long long flags);
+/* Exported by cgo (//export in tap.go): 1 to consume the key, 0 to pass it. */
+extern int goKey(unsigned short keyCode, unsigned long long flags, char *app);
 
 static CFMachPortRef gTap;
-
-/* ── Process filter ────────────────────────────────────────────────────── */
-
-#define MAX_FILTER 32
-
-static char            filterProcs[MAX_FILTER][256];
-static int             nFilter    = 0;
-static int             nListeners = 0;
-static pthread_mutex_t filterMu   = PTHREAD_MUTEX_INITIALIZER;
-
-void setListenerCount(int n) {
-	pthread_mutex_lock(&filterMu);
-	nListeners = n;
-	pthread_mutex_unlock(&filterMu);
-}
-void clearFilter(void) {
-	pthread_mutex_lock(&filterMu);
-	nFilter = 0;
-	pthread_mutex_unlock(&filterMu);
-}
-void addFilterProc(const char *name) {
-	pthread_mutex_lock(&filterMu);
-	if (nFilter < MAX_FILTER) {
-		strncpy(filterProcs[nFilter], name, 255);
-		filterProcs[nFilter][255] = '\0';
-		nFilter++;
-	}
-	pthread_mutex_unlock(&filterMu);
-}
-
-#define PASSTHROUGH_MAGIC 0xACE50001LL
-
-static int
-shouldInterceptEvent(CGEventRef event)
-{
-	pthread_mutex_lock(&filterMu);
-	int nl = nListeners, nf = nFilter;
-	pthread_mutex_unlock(&filterMu);
-
-	if (nl == 0) return 0;
-	if (nf == 0) return 1;
-
-	pid_t pid = (pid_t)CGEventGetIntegerValueField(event,
-	    kCGEventTargetUnixProcessID);
-	char name[256]; name[0] = '\0';
-	proc_name((int)pid, name, (uint32_t)sizeof(name));
-
-	pthread_mutex_lock(&filterMu);
-	int ok = 0;
-	for (int i = 0; i < nFilter; i++)
-		if (strcmp(name, filterProcs[i]) == 0) { ok = 1; break; }
-	pthread_mutex_unlock(&filterMu);
-	return ok;
-}
-
-/* ── Pending-event circular buffer ─────────────────────────────────────── */
-
-/*
- * gPending is a circular buffer of CFRetained CGEventRefs waiting for
- * write-back acks from the cawk pipeline.
- *
- *   gHead  — next slot the tap thread writes into (producer).
- *   gTail  — next slot ackNext() consumes (consumer, called from Go).
- *
- * Invariant: gHead == gTail means empty; a slot is occupied when gTail ≠ gHead.
- * The buffer is considered full when (gHead+1)%CAP == gTail (one slot wasted).
- *
- * gPendMu serialises access.  It is held briefly in the tap callback and
- * in ackNext(); it is never held while posting events (CFPost is async).
- *
- * pendingKeyUp[kc] stores a CFRetained hardware keyUp event that arrived
- * while events for kc were still in the buffer.  ackNext() posts (or drops)
- * it once hasPendingForKey() returns false.
- */
-
-#define PENDING_CAP 4096
-
-typedef struct { CGEventRef ref; uint16_t kc; } PendingEntry;
-
-static PendingEntry    gPending[PENDING_CAP];
-static int             gHead = 0, gTail = 0;
-static pthread_mutex_t gPendMu = PTHREAD_MUTEX_INITIALIZER;
-
-static CGEventRef pendingKeyUp[256];
-
-/* Must be called with gPendMu held. */
-static int
-hasPendingForKey(uint16_t kc)
-{
-	for (int i = gTail; i != gHead; i = (i + 1) % PENDING_CAP)
-		if (gPending[i].kc == kc) return 1;
-	return 0;
-}
-
-/*
- * ackNext — called from Go for each write-back line received on the keys
- * file.  Dequeues the oldest pending entry, forwards or drops it, then
- * releases any buffered keyUp for that keycode if no more events remain.
- */
-void
-ackNext(int forward)
-{
-	pthread_mutex_lock(&gPendMu);
-	if (gTail == gHead) {          /* spurious ack — nothing pending */
-		pthread_mutex_unlock(&gPendMu);
-		return;
-	}
-	PendingEntry e = gPending[gTail];
-	gTail = (gTail + 1) % PENDING_CAP;
-
-	/* Check for remaining events for this keycode after advancing tail. */
-	int more = hasPendingForKey(e.kc);
-	CGEventRef up = NULL;
-	if (!more && pendingKeyUp[e.kc & 0xFF]) {
-		up = pendingKeyUp[e.kc & 0xFF];
-		pendingKeyUp[e.kc & 0xFF] = NULL;
-	}
-	pthread_mutex_unlock(&gPendMu);
-
-	/* Post or release the keyDown (outside the lock — CGEventPost is safe).
-	 * kCGAnnotatedSessionEventTap delivers directly to the target application
-	 * with minimal latency.  Session-level re-posting (kCGSessionEventTap)
-	 * routes through the Dock's synchronous Mission Control tap for every
-	 * event, adding a full keypress of lag.  We handle ctrl+key shortcuts by
-	 * not intercepting them in the first place (see tapCallback below). */
-	if (forward) {
-		CGEventSetIntegerValueField(e.ref, kCGEventSourceUserData,
-		    PASSTHROUGH_MAGIC);
-		CGEventPost(kCGAnnotatedSessionEventTap, e.ref);
-	}
-	CFRelease(e.ref);
-
-	/* Post or release the buffered keyUp with the same disposition. */
-	if (up) {
-		if (forward) {
-			CGEventSetIntegerValueField(up, kCGEventSourceUserData,
-			    PASSTHROUGH_MAGIC);
-			CGEventPost(kCGAnnotatedSessionEventTap, up);
-		}
-		CFRelease(up);
-	}
-}
-
-/*
- * drainAllPending — discard every entry in gPending without forwarding.
- *
- * Called from Go's releaseKeysReader (while keysReaderMu is held) so that
- * a pipeline restart begins with an empty circular buffer.  Without this,
- * one stale gPending entry survives each crash-restart cycle, permanently
- * offsetting the ack queue by one: the N-th ack posts event N-1.
- */
-void
-drainAllPending(void)
-{
-	pthread_mutex_lock(&gPendMu);
-	while (gHead != gTail) {
-		PendingEntry e = gPending[gTail];
-		gTail = (gTail + 1) % PENDING_CAP;
-		CGEventRef up = pendingKeyUp[e.kc & 0xFF];
-		pendingKeyUp[e.kc & 0xFF] = NULL;
-		pthread_mutex_unlock(&gPendMu);   /* release during CF calls */
-		CFRelease(e.ref);
-		if (up) CFRelease(up);
-		pthread_mutex_lock(&gPendMu);
-	}
-	pthread_mutex_unlock(&gPendMu);
-}
 
 /* ── System shortcuts ──────────────────────────────────────────────────── */
 
@@ -407,52 +239,6 @@ isSysKey(CGKeyCode kc, unsigned long long flags)
 	return 0;
 }
 
-/* ── Grabs ───────────────────────────────────────────────────────────────── */
-
-/*
- * The keystrokes the pipeline has bound.  Any other keystroke passes
- * through untouched, so whatever the system does with it (screenshot
- * selection, Spotlight, input methods) happens normally.  With no grabs
- * set, every keystroke is intercepted, as before grabs existed.
- */
-#define MAX_GRAB 128
-
-typedef struct { CGKeyCode kc; unsigned long long mods; } Grab;
-
-static Grab grabs[MAX_GRAB];
-static int  nGrab = 0;
-
-void
-clearGrabs(void)
-{
-	pthread_mutex_lock(&filterMu);
-	nGrab = 0;
-	pthread_mutex_unlock(&filterMu);
-}
-
-void
-addGrab(unsigned short kc, unsigned long long mods)
-{
-	pthread_mutex_lock(&filterMu);
-	if (nGrab < MAX_GRAB)
-		grabs[nGrab++] = (Grab){ kc, mods & MOD_MASK };
-	pthread_mutex_unlock(&filterMu);
-}
-
-static int
-isGrabbed(CGKeyCode kc, unsigned long long flags)
-{
-	int ok;
-
-	flags &= MOD_MASK;
-	pthread_mutex_lock(&filterMu);
-	ok = nGrab == 0;
-	for (int i = 0; i < nGrab && !ok; i++)
-		ok = grabs[i].kc == kc && grabs[i].mods == flags;
-	pthread_mutex_unlock(&filterMu);
-	return ok;
-}
-
 /* ── Modifier check ─────────────────────────────────────────────────────── */
 
 static int
@@ -469,6 +255,13 @@ isModifier(CGKeyCode kc)
 
 /* ── CGEventTap callback ───────────────────────────────────────────────── */
 
+/*
+ * consumed[kc] is set when a key-down is consumed, so its auto-repeats and
+ * its key-up are consumed too and the application never sees half a
+ * keystroke.  Only the tap's run loop thread touches it.
+ */
+static unsigned char consumed[256];
+
 static CGEventRef
 tapCallback(CGEventTapProxy proxy, CGEventType type,
             CGEventRef event, void *refcon)
@@ -480,84 +273,37 @@ tapCallback(CGEventTapProxy proxy, CGEventType type,
 		CGEventTapEnable(gTap, true);
 		return event;
 	}
-
-	if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) ==
-	    PASSTHROUGH_MAGIC)
+	if (type != kCGEventKeyDown && type != kCGEventKeyUp)
 		return event;
 
-	if (type == kCGEventFlagsChanged)
-		return event;
-
-	CGKeyCode          kc    = (CGKeyCode)CGEventGetIntegerValueField(
-	                               event, kCGKeyboardEventKeycode);
+	CGKeyCode kc = (CGKeyCode)CGEventGetIntegerValueField(event,
+	    kCGKeyboardEventKeycode);
 	unsigned long long flags = (unsigned long long)CGEventGetFlags(event);
+	unsigned char *c = &consumed[kc & 0xFF];
 
 	if (type == kCGEventKeyUp) {
-		pthread_mutex_lock(&gPendMu);
-		int pending = hasPendingForKey((uint16_t)kc);
-		if (pending) {
-			CFRetain(event);
-			pendingKeyUp[kc & 0xFF] = event;
+		if (*c) {
+			*c = 0;
+			return NULL;
 		}
-		pthread_mutex_unlock(&gPendMu);
-		return pending ? NULL : event;
+		return event;
 	}
 
-	if (type == kCGEventKeyDown) {
-		if (isModifier(kc))
-			return event;
+	if (CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat))
+		return *c ? NULL : event;
+	if (isModifier(kc) || isSysKey(kc, flags))
+		return event;
 
-		/*
-		 * Auto-repeat events: pass through immediately without entering
-		 * the pipeline.  The session-level auto-repeat timer only starts
-		 * when a keyDown passes through kCGSessionEventTap, so if we
-		 * suppress the first keyDown the OS never generates repeats.
-		 * By the time the first repeat arrives (≥500 ms later) the
-		 * initial keyDown has long since been acked and the C buffer is
-		 * empty, so there is no ordering hazard.
-		 */
-		int isRepeat = (int)CGEventGetIntegerValueField(event,
-		    kCGKeyboardEventAutorepeat);
-		if (isRepeat)
-			return event;
+	pid_t pid = (pid_t)CGEventGetIntegerValueField(event,
+	    kCGEventTargetUnixProcessID);
+	char app[256];
+	app[0] = '\0';
+	proc_name((int)pid, app, (uint32_t)sizeof app);
 
-		/*
-		 * Pass ctrl+key combos through unintercepted.  Spaces switching
-		 * (ctrl+arrow, ctrl+number) and other ctrl shortcuts are handled
-		 * by the window server after ALL CGEventTaps have run.  If we
-		 * suppress a ctrl+key event here, it never reaches the window
-		 * server and Spaces switching silently fails.  Passing through
-		 * lets it reach the window server naturally.
-		 *
-		 * kCGEventFlagMaskControl = 0x0000000000040000
-		 */
-		if (flags & kCGEventFlagMaskControl)
-			return event;
-
-		if (isSysKey(kc, flags))
-			return event;
-
-		if (!isGrabbed(kc, flags))
-			return event;
-
-		if (!shouldInterceptEvent(event))
-			return event;
-
-		pthread_mutex_lock(&gPendMu);
-		int next = (gHead + 1) % PENDING_CAP;
-		if (next == gTail) {
-			pthread_mutex_unlock(&gPendMu);
-			return event;
-		}
-		CFRetain(event);
-		gPending[gHead] = (PendingEntry){ event, (uint16_t)kc };
-		gHead = next;
-		pthread_mutex_unlock(&gPendMu);
-
-		goKeyDown((unsigned short)kc, flags);
+	if (goKey(kc, flags, app)) {
+		*c = 1;
 		return NULL;
 	}
-
 	return event;
 }
 
@@ -567,23 +313,14 @@ void
 startEventTap(void)
 {
 	loadSysKeys();
-	memset(pendingKeyUp, 0, sizeof pendingKeyUp);
-	gHead = gTail = 0;
 
 	CGEventMask mask =
 	    CGEventMaskBit(kCGEventKeyDown) |
-	    CGEventMaskBit(kCGEventKeyUp)   |
-	    CGEventMaskBit(kCGEventFlagsChanged);
+	    CGEventMaskBit(kCGEventKeyUp);
 
 	/*
-	 * kCGTailAppendEventTap: we are inserted at the END of the session-level
-	 * tap chain, after all head-insert taps (including the Dock's Mission
-	 * Control tap).  Events that Mission Control consumes (ctrl+arrow for
-	 * Spaces switching, ctrl+number for direct-Space jump, etc.) never reach
-	 * us.  Events that pass through all head-insert taps arrive here; we
-	 * suppress them (return NULL) and re-post at kCGAnnotatedSessionEventTap
-	 * so they are delivered directly to the target application without
-	 * traversing any session-level tap again — giving lag-free delivery.
+	 * Appended at the end of the session tap chain, after the Dock's
+	 * Mission Control tap, so the shortcuts it consumes never reach us.
 	 */
 	gTap = CGEventTapCreate(
 		kCGSessionEventTap,
