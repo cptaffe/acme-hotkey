@@ -89,7 +89,7 @@ func (h *hub) run(fired []*seq.Accept, key string) {
 		if a.Action == "" {
 			continue
 		}
-		cmd := exec.Command(h.rc, "-c", h.rules.Grammar.Prelude+"\n"+a.Action)
+		cmd := exec.Command(h.rc, "-c", h.rules.Prelude+"\n"+a.Action)
 		cmd.Env = append(os.Environ(), "app="+h.app, "key="+key)
 		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 		if err := cmd.Start(); err != nil {
