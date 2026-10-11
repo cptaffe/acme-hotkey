@@ -18,7 +18,7 @@ type hub struct {
 	mu     sync.Mutex
 	text   string
 	rules  *hotkey.Rules
-	m      *hotkey.Matcher
+	m      *seq.Machine
 	app    string
 	timers map[string]*time.Timer
 	gen    int
@@ -42,10 +42,10 @@ func (h *hub) key(key, app string) bool {
 		return false
 	}
 	h.app = app
-	consume, fired, waits := h.m.Key(key, seq.Env{"app": app})
-	h.arm(waits)
+	taken, fired := h.m.Step(h.rules.Table.Alpha.Of(key), seq.Env{"app": app})
+	h.arm(h.m.Waits())
 	h.run(fired, key)
-	return consume
+	return taken
 }
 
 func (h *hub) sendLines(text string) error {
@@ -77,8 +77,8 @@ func (h *hub) arm(waits []string) {
 			if gen != h.gen {
 				return
 			}
-			fired, waits := h.m.Event(name, seq.Env{"app": h.app})
-			h.arm(waits)
+			_, fired := h.m.Step(h.rules.Table.Alpha.Of(name), seq.Env{"app": h.app})
+			h.arm(h.m.Waits())
 			h.run(fired, name)
 		})
 	}
@@ -104,12 +104,17 @@ func (h *hub) parse(name, text string) (*hotkey.Rules, error) {
 	return hotkey.Parse(strings.NewReader(text), name, knownKey)
 }
 
-func (h *hub) install(text string, r *hotkey.Rules) {
+func (h *hub) install(text string, r *hotkey.Rules) error {
+	m, err := seq.NewMachine(r.Table, "")
+	if err != nil {
+		return err
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.rules = r
 	h.arm(nil)
-	h.text, h.m = text, r.Matcher()
+	h.text, h.m = text, m
+	return nil
 }
 
 func (h *hub) source() string {
@@ -126,6 +131,9 @@ func (h *hub) card() string {
 	}
 	var b strings.Builder
 	for _, r := range h.rules.Grammar.Rules {
+		if r.Include != "" {
+			continue
+		}
 		fmt.Fprintf(&b, "%s\t%s\t%s\t{ %s }\n", r.Scope, r.Pattern, r.Label, strings.Join(strings.Fields(r.Action), " "))
 	}
 	return b.String()

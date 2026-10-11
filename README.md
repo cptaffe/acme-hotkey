@@ -55,21 +55,28 @@ fn ctl { echo $1 | 9p write acme/`{9p read acme-focused/focus}/ctl }
 %}
 %delay settle 1s
 
-acme: when app == "devdraw"
+main:
+	-> acme when app == "devdraw"
+
+acme:
 	%settles settle
 	command-s		{ ctl put }	# save
 	control-x control-s	{ ctl put }
 	command-m		-> mode
 
 mode:
-	escape			{ ctl show } -> acme
+	escape			{ ctl show } -> main
 ```
 
-- **Scopes.** A line `name:` starts a scope, optionally with `when` and an
-  expression over `app`, the process the key is headed for: `==`, `!=`,
-  `~` (a regular expression), `&&`, `||`, `!`, and parentheses.
+- **Scopes.** A line `name:` starts a scope.  Matching starts in the
+  first, and returns to the current scope after each match.
+- **Includes.** `-> scope` on a line of its own reads that scope's rules
+  in, optionally with `when` and an expression over `app`, the process
+  the key is headed for: `==`, `!=`, `~` (a regular expression), `&&`,
+  `||`, `!`, and parentheses.  A key is taken only when a rule that holds
+  binds it; every other key passes through.
 - **Rules.** Keys, an rc block in braces, and optionally `-> scope`, which
-  makes that scope the mode until another rule leaves it.  A key is the
+  makes that scope current until another rule leaves it.  A key is the
   name the layout gives it after any of `command-`, `shift-`, `control-`,
   and `option-`, in any order.  Several keys make a sequence.  A comment
   after a rule is its label.  Blocks may span lines and nest.
@@ -79,8 +86,8 @@ mode:
   lets a rule that is also the start of a longer one wait that long for the
   next key; without it the pair is an error, as are two rules on the same
   keys.
-- **Order.** With no mode, the first scope whose `when` holds and which
-  binds the key takes it.
+- **Order.** When two rules that hold bind the same keys, the one written
+  first takes them.
 - **System shortcuts** (Spotlight, screenshots, and any other enabled
   symbolic hotkey) always pass through.
 

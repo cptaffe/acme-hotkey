@@ -72,7 +72,9 @@ func buildServer(h *hub, tree *srv9p.Tree, rulesFile, cardFile, sendFile *srv9p.
 				log.Printf("acme-hotkey: %v", err)
 				return
 			}
-			h.install(string(a.buf), f)
+			if err := h.install(string(a.buf), f); err != nil {
+				log.Printf("acme-hotkey: %v", err)
+			}
 		},
 	}
 }

@@ -31,10 +31,11 @@ func main() {
 
 	if text, err := os.ReadFile(*rulesPath); err == nil {
 		f, err := theHub.parse(*rulesPath, string(text))
+		if err == nil {
+			err = theHub.install(string(text), f)
+		}
 		if err != nil {
 			log.Printf("acme-hotkey: %v", err)
-		} else {
-			theHub.install(string(text), f)
 		}
 	} else if !os.IsNotExist(err) {
 		log.Printf("acme-hotkey: %v", err)
