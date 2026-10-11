@@ -22,8 +22,17 @@ var modFlags = []struct {
 	{0x080000, "option"},
 }
 
+var keyNames = map[string]bool{}
+
 // initKeys must run before rules are loaded, which name keys.
-func initKeys() { C.initKeyNames() }
+func initKeys() {
+	C.initKeyNames()
+	for code := 0; code < 256; code++ {
+		if name := keyCodeName(uint16(code)); name != "" {
+			keyNames[name] = true
+		}
+	}
+}
 
 func startTap() { C.startEventTap() }
 
@@ -60,10 +69,8 @@ func keyCodeName(code uint16) string {
 }
 
 func knownKey(name string) error {
-	for code := 0; code < 256; code++ {
-		if keyCodeName(uint16(code)) == name {
-			return nil
-		}
+	if !keyNames[name] {
+		return fmt.Errorf("no such key on this keyboard layout")
 	}
-	return fmt.Errorf("no such key on this keyboard layout")
+	return nil
 }
