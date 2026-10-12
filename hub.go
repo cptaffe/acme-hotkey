@@ -42,7 +42,14 @@ func (h *hub) key(key, app string) bool {
 		return false
 	}
 	h.app = app
-	taken, fired := h.m.Step(h.rules.Table.Alpha.Of(key), seq.Env{"app": app})
+	env := seq.Env{"app": app}
+	var taken bool
+	var fired []*seq.Accept
+	if s, ok := h.rules.Table.Alpha.Of(key); ok {
+		taken, fired = h.m.Step(s, env)
+	} else {
+		fired = h.m.Settle(env)
+	}
 	h.arm(h.m.Waits())
 	h.run(fired, key)
 	return taken
@@ -77,7 +84,8 @@ func (h *hub) arm(waits []string) {
 			if gen != h.gen {
 				return
 			}
-			_, fired := h.m.Step(h.rules.Table.Alpha.Of(name), seq.Env{"app": h.app})
+			s, _ := h.rules.Table.Alpha.Of(name)
+			_, fired := h.m.Step(s, seq.Env{"app": h.app})
 			h.arm(h.m.Waits())
 			h.run(fired, name)
 		})
