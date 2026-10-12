@@ -109,7 +109,7 @@ func (h *hub) run(fired []*seq.Accept, key string) {
 }
 
 func (h *hub) parse(name, text string) (*hotkey.Rules, error) {
-	return hotkey.Parse(strings.NewReader(text), name, knownKey)
+	return hotkey.Parse(strings.NewReader(text), name, keyboard)
 }
 
 func (h *hub) install(text string, r *hotkey.Rules) error {
