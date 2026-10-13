@@ -42,14 +42,13 @@ func (h *hub) key(key, app string) bool {
 		return false
 	}
 	h.app = app
-	env := seq.Env{"app": app}
-	var taken bool
-	var fired []*seq.Accept
-	if s, ok := h.rules.Table.Alpha.Of(key); ok {
-		taken, fired = h.m.Step(s, env)
-	} else {
-		fired = h.m.Settle(env)
+	s, ok := h.rules.Table.Alpha.Of(key)
+	if !ok {
+		h.m.Reset()
+		h.arm(nil)
+		return false
 	}
+	taken, fired := h.m.Step(s, seq.Env{"app": app})
 	h.arm(h.m.Waits())
 	h.run(fired, key)
 	return taken

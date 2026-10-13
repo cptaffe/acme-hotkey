@@ -59,13 +59,15 @@ main:
 	-> acme when app == "devdraw"
 
 acme:
-	%settles settle
 	command-s		{ ctl put }	# save
 	control-x control-s	{ ctl put }
-	command-m		-> mode
+	control-x settle	{ ctl show }
+	control-x peek any	{ ctl show }
+	command-g		{ ctl nomark } -> group
 
-mode:
-	escape			{ ctl show } -> main
+group:
+	-> acme
+	escape			{ ctl mark } -> main
 ```
 
 - **Scopes.** A line `name:` starts a scope.  Matching starts in the
@@ -82,10 +84,16 @@ mode:
   after a rule is its label.  Blocks may span lines and nest.
 - **The prelude** between `%{` and `%}` is prepended to every block.  Each
   block runs in its own rc with `$app` and `$key` set.
-- **Delays** are named: `%delay name duration`.  `%settles name` in a scope
-  lets a rule that is also the start of a longer one wait that long for the
-  next key; without it the pair is an error, as are two rules on the same
-  keys.
+- **Delays** are named: `%delay name duration`, and a delay's name in a
+  pattern is read when the machine has waited that long, so
+  `control-x settle` fires once a second passes with nothing after
+  `control-x`.  A rule that is also the start of a longer one is an error
+  unless it ends this way, as are two rules on the same keys.
+- **`any`** reads a key no other rule names at that point, and `peek`
+  reads the key that ends a rule without taking it, so `control-x peek
+  any` fires at once and lets the next key do what it would have.  An
+  empty block takes a key and does nothing; `... any { }` keeps every key
+  in a scope from the application.
 - **Order.** When two rules that hold bind the same keys, the one written
   first takes them.
 - **System shortcuts** (Spotlight, screenshots, and any other enabled
