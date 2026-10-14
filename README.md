@@ -62,7 +62,7 @@ acme:
 	command-s		{ ctl put }	# save
 	control-x control-s	{ ctl put }
 	control-x settle	{ ctl show }
-	control-x peek any	{ ctl show }
+	control-x / any	{ ctl show }
 	command-g		{ ctl nomark } -> group
 
 group:
@@ -89,11 +89,16 @@ group:
   `control-x settle` fires once a second passes with nothing after
   `control-x`.  A rule that is also the start of a longer one is an error
   unless it ends this way, as are two rules on the same keys.
-- **`any`** reads a key no other rule names at that point, and `peek`
-  reads the key that ends a rule without taking it, so `control-x peek
-  any` fires at once and lets the next key do what it would have.  An
-  empty block takes a key and does nothing; `... any { }` keeps every key
-  in a scope from the application.
+- **Patterns** are expressions over keys, as in a lexer: keys in
+  sequence, `|` between alternatives, `( )`, and `*`, `+` or `?` after a
+  key or group.  `\` takes one set of keys from another, as in
+  `any \ escape`, while a `-` only joins the parts of a chord.  A key
+  that is only punctuation is quoted, as in `"/"`.
+- **`any`** reads a key no other rule names at that point, and `/` ends
+  a pattern with a key it reads without taking, so `control-x / any`
+  fires at once and lets the next key do what it would have.  An empty
+  block takes a key and does nothing; `... any { }` keeps every key in a
+  scope from the application.
 - **Order.** When two rules that hold bind the same keys, the one written
   first takes them.
 - **System shortcuts** (Spotlight, screenshots, and any other enabled
