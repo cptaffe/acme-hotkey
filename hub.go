@@ -22,7 +22,7 @@ type hub struct {
 	app    string
 	timers map[string]*time.Timer
 	gen    int
-	rc     string
+	spawn  func(script string, env []string)
 }
 
 var theHub *hub
@@ -32,7 +32,22 @@ func newHub() *hub {
 	if err != nil {
 		rc = filepath.Join(os.Getenv("PLAN9"), "bin", "rc")
 	}
-	return &hub{rc: rc, timers: map[string]*time.Timer{}}
+	return &hub{spawn: func(script string, env []string) { start(rc, script, env) }, timers: map[string]*time.Timer{}}
+}
+
+func start(rc, script string, env []string) {
+	cmd := exec.Command(rc, "-c", script)
+	cmd.Env = append(os.Environ(), env...)
+	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	if err := cmd.Start(); err != nil {
+		log.Printf("acme-hotkey: %v", err)
+		return
+	}
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			log.Printf("acme-hotkey: %v", err)
+		}
+	}()
 }
 
 func (h *hub) key(key, app string) bool {
@@ -62,7 +77,7 @@ func (h *hub) sendLines(text string) error {
 		}
 		k, err := hotkey.Canon(f[1])
 		if err != nil {
-			return fmt.Errorf("send: %v", err)
+			return fmt.Errorf("send: %w", err)
 		}
 		h.key(k, f[0])
 	}
@@ -96,14 +111,7 @@ func (h *hub) run(fired []*seq.Accept, key string) {
 		if a.Action == "" {
 			continue
 		}
-		cmd := exec.Command(h.rc, "-c", h.rules.Prelude+"\n"+a.Action)
-		cmd.Env = append(os.Environ(), "app="+h.app, "key="+key)
-		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
-		if err := cmd.Start(); err != nil {
-			log.Printf("acme-hotkey: %v", err)
-			continue
-		}
-		go cmd.Wait()
+		h.spawn(h.rules.Prelude+"\n"+a.Action, []string{"app=" + h.app, "key=" + key})
 	}
 }
 
@@ -141,7 +149,14 @@ func (h *hub) card() string {
 		if r.Include != "" {
 			continue
 		}
-		fmt.Fprintf(&b, "%s\t%s\t%s\t{ %s }\n", r.Scope, r.Pattern, r.Label, strings.Join(strings.Fields(r.Action), " "))
+		fmt.Fprintf(&b, "%s\t%s\t%s\t%s\n", r.Scope, r.Pattern, r.Label, block(r.Action))
 	}
 	return b.String()
+}
+
+func block(action string) string {
+	if body := strings.Join(strings.Fields(action), " "); body != "" {
+		return "{ " + body + " }"
+	}
+	return "{ }"
 }
