@@ -14,7 +14,7 @@ IDENTITY := LocalCodeSign
 # certificate, preserving the stable identity.  TCC keeps the permission
 # across rebuilds as long as the identity is consistent.
 
-.PHONY: install sign restart deploy all
+.PHONY: install sign restart deploy all check lint test
 
 all: install
 
@@ -32,3 +32,14 @@ restart:
 	echo 'restart acme-hotkey' | 9p write init/ctl
 
 deploy: install restart
+
+GOLANGCI = go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+
+check: lint test
+
+lint:
+	go vet ./...
+	$(GOLANGCI) run ./...
+
+test:
+	go test -race ./...

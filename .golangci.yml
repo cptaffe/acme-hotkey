@@ -1,0 +1,35 @@
+version: "2"
+
+linters:
+  enable:
+    - gocyclo
+    - gocognit
+    - errorlint
+    - gocritic
+    - misspell
+    - nakedret
+    - prealloc
+    - unconvert
+    - unparam
+    - wastedassign
+  settings:
+    gocyclo:
+      min-complexity: 15
+    gocognit:
+      min-complexity: 20
+  exclusions:
+    generated: strict
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters: [gocyclo, gocognit]
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: false
+
+formatters:
+  enable:
+    - gofmt
